@@ -1,7 +1,7 @@
 javascript:
   extensions:
     - js
-  grammar: https://github.com/tree-sitter/tree-sitter-javascript/releases/download/v0.23.1/tree-sitter-javascript.wasm
+  grammar_path: https://github.com/tree-sitter/tree-sitter-javascript/releases/download/v0.23.1/tree-sitter-javascript.wasm
   queries:
     methods: |
       (
@@ -46,8 +46,13 @@ javascript:
 rust:
   extensions:
     - rs
-  grammar: https://github.com/tree-sitter/tree-sitter-rust/releases/download/v0.24.0/tree-sitter-rust.wasm
+  grammar_path: https://github.com/tree-sitter/tree-sitter-rust/releases/download/v0.24.0/tree-sitter-rust.wasm
   queries:
+    # TODO: don't process associated member and associated type defs inside traits individually
+    # TODO: How do we determine the surrounding class for a method?
+    traits: |
+      (trait_item
+          name: (type_identifier) @name.definition.interface) @definition.interface
     types: |
       (struct_item
           name: (type_identifier) @name.definition.class) @definition.class
@@ -57,24 +62,18 @@ rust:
 
       (union_item
           name: (type_identifier) @name.definition.class) @definition.class
+    functions: |
+      (function_item
+          name: (identifier) @name.definition.function) @definition.function
 
-      ; type aliases
-
-      (type_item
-          name: (type_identifier) @name.definition.class) @definition.class
-
-    methods: |
-      (declaration_list
-          (function_item
-              name: (identifier) @name.definition.method) @definition.method)
-
-#     functions: |
-#       (function_item
-#           name: (identifier) @name.definition.function) @definition.function
+#      (type_item
+#          name: (type_identifier) @name.definition.class) @definition.class
 #
-#     traits: |
-#       (trait_item
-#           name: (type_identifier) @name.definition.interface) @definition.interface
+#      #### Seems to overlap with functions. Need to check tree-sitter docs
+#      methods: |
+#        (declaration_list
+#            (function_item
+#                name: (identifier) @name.definition.method) @definition.method)
 #
 #     modules: |
 #       (mod_item

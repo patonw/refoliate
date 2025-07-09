@@ -10,11 +10,22 @@ use tokio::io::AsyncReadExt;
 use tree_sitter::{Language, Parser, Query, QueryCursor, WasmStore, wasmtime::Engine};
 use tree_sitter::{QueryMatch, StreamingIterator};
 
+use rig::Embed;
 use tokio::task;
+
+#[derive(Embed, serde::Deserialize, serde::Serialize, Debug, Clone)]
+pub struct CodeSnippet {
+    pub path: String,
+    pub name: String,
+    pub body: String,
+
+    #[embed]
+    pub summary: String,
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LanguageSpec {
-    pub grammar: String,
+    pub grammar_path: String,
     pub queries: BTreeMap<String, String>,
     pub extensions: Vec<String>,
     pub enabled: Option<bool>,
@@ -60,7 +71,7 @@ impl SourceWalker {
         lang_name: String,
         lang_spec: &LanguageSpec,
     ) -> Result<CodeSnipper> {
-        let grammar_url = lang_spec.grammar.clone();
+        let grammar_url = lang_spec.grammar_path.clone();
         let grammar_path = task::spawn_blocking(move || cached_path(&grammar_url)).await??;
 
         let mut grammar_file = File::open(grammar_path).await?;
@@ -111,7 +122,7 @@ impl SourceWalker {
     pub async fn process_matches<P: AsRef<Path>>(
         &mut self,
         path: P,
-        cb: impl AsyncFn(&QueryMatch, &[u8]),
+        cb: impl AsyncFn(&Path, &Query, &QueryMatch, &[u8]),
     ) -> Result<()> {
         for item in Walk::new(path) {
             match item {
@@ -140,7 +151,7 @@ impl SourceWalker {
                                 qc.matches(query, tree.root_node(), source_code.as_slice());
 
                             while let Some(n) = ms.next() {
-                                cb(n, &source_code).await;
+                                cb(entry.path(), query, n, &source_code).await;
                             }
                         }
                     }
