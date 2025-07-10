@@ -27,4 +27,6 @@ let
 in
 {
   inherit pkgs libraries rust-toolchain;
+
+  embasee = callPackage ./embasee {};
 }
