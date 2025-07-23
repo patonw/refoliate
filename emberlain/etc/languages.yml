@@ -56,19 +56,17 @@ rust:
     types: |
       (struct_item
           name: (type_identifier) @name.definition.class) @definition.class
-
       (enum_item
           name: (type_identifier) @name.definition.class) @definition.class
-
       (union_item
           name: (type_identifier) @name.definition.class) @definition.class
+      (type_item
+          name: (type_identifier) @name.definition.class) @definition.class
+
     functions: |
       (function_item
           name: (identifier) @name.definition.function) @definition.function
 
-#      (type_item
-#          name: (type_identifier) @name.definition.class) @definition.class
-#
 #      #### Seems to overlap with functions. Need to check tree-sitter docs
 #      methods: |
 #        (declaration_list

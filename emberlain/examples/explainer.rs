@@ -14,10 +14,11 @@ use tokio::sync::mpsc::{self, Receiver};
 use tokio::task;
 
 use emberlain::SourceWalker;
+use tracing::warn;
 
 const LLM_MODEL: &str = "devstral:latest";
 const LLM_BASE_URL: &str = "http://10.10.10.100:11434";
-const COLLECTION_NAME: &str = "foliage_code";
+const COLLECTION_NAME: &str = "chipsndip";
 const EMBED_MODEL: FastembedModel = FastembedModel::MxbaiEmbedLargeV1Q;
 const EMBEDDING_DIMS: u64 = 1024;
 
@@ -69,7 +70,7 @@ async fn main() -> Result<()> {
         let mut src_walk = SourceWalker::default();
         src_walk.load_languages(langspec)?;
         src_walk
-            .process_matches(target_dir, async move |p, q, n, src| {
+            .aprocess_directory(target_dir, async move |p, q, n, src| {
                 println!("^_- Match {n:?} at {p:?}");
                 let mut ident: Option<String> = None;
                 let mut kind: Option<String> = None;
@@ -124,13 +125,17 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            let resp = agent.prompt(&snippet.body).await;
-            let snippet = CodeSnippet {
-                summary: resp.unwrap_or("".to_string()),
-                ..snippet
-            };
-
-            summary_tx.send(snippet).await.unwrap();
+            // TODO: error handling
+            match agent.prompt(&snippet.body).await {
+                Ok(resp) => {
+                    let snippet = CodeSnippet {
+                        summary: resp,
+                        ..snippet
+                    };
+                    summary_tx.send(snippet).await.unwrap();
+                }
+                Err(err) => warn!("Could not summarize snippet: {err:?}"),
+            }
         }
     });
 

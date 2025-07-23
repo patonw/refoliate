@@ -13,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
         let mut src_walk = SourceWalker::default();
         src_walk.load_languages(langspec)?;
         src_walk
-            .process_matches("./", async move |n, src| {
+            .aprocess_directory("./", async move |_p, _q, n, src| {
                 println!("^_- Match {n:?}");
                 for cap in n.captures {
                     println!(">.> Capture {cap:?} ~~ {:?}", cap.node.utf8_text(src));
