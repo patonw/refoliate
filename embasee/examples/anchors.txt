@@ -1,0 +1,6 @@
+What is the purpose of anchor queries?
+How can we add tags to todo items?
+What is responsible for listing the embedding models for the current collection?
+What kind of database is used to store vectors?
+How are the snippet summaries created?
+How can users bookmark the page when the agent window is open?

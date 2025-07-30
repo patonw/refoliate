@@ -7,10 +7,13 @@ use qdrant_client::Qdrant;
 use qdrant_client::qdrant::point_id::PointIdOptions;
 use qdrant_client::qdrant::vectors_output::VectorsOptions;
 use qdrant_client::qdrant::{
-    GetPointsBuilder, QueryPointsBuilder, ScrollPointsBuilder, vectors_config,
+    GetPointsBuilder, PointId, QueryPointsBuilder, ScrollPointsBuilder, vectors_config,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::env;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -28,6 +31,20 @@ use egui_plot::{MarkerShape, Plot, PlotResponse, Points};
 
 use embasee::{optzip, pydict, pyimport};
 
+// TODO: set fastembed cache using XDG cache dir
+
+static FASTEMBED_CACHE_DIR: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("FASTEMBED_CACHE_DIR")
+        .ok()
+        .or_else(|| {
+            dirs::cache_dir().and_then(|mut d| {
+                d.push("fastembed");
+                d.into_os_string().into_string().ok()
+            })
+        })
+        .unwrap_or_else(fastembed::get_cache_dir)
+});
+
 static UMAP: LazyLock<Py<PyAny>> = LazyLock::new(|| pyimport!("umap", "UMAP").unwrap());
 
 static UMAP_NEIGHBORS: LazyLock<u64> = LazyLock::new(|| {
@@ -40,6 +57,22 @@ static UMAP_NEIGHBORS: LazyLock<u64> = LazyLock::new(|| {
 const PALETTE: colorous::Gradient = colorous::ORANGE_RED;
 static VECSTORE_URL: LazyLock<String> =
     LazyLock::new(|| env::var("VECSTORE_URL").unwrap_or("http://localhost:6334".to_string()));
+
+static ANCHOR_QUERIES: LazyLock<Vec<String>> = LazyLock::new(|| {
+    fn anchors() -> anyhow::Result<Vec<String>> {
+        let fname = env::var("ANCHOR_QUERIES")?;
+
+        let file = File::open(fname)?;
+        let buf = BufReader::new(file);
+        let lines = buf.lines().map_while(Result::ok).collect::<Vec<_>>();
+        Ok(lines)
+    }
+
+    anchors().unwrap_or_default()
+});
+
+// TODO: also log and embed query history to improve reduction.
+// Don't display points for queries though.
 
 fn main() -> anyhow::Result<()> {
     env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).
@@ -66,7 +99,6 @@ fn main() -> anyhow::Result<()> {
         Box::new(|cc| Ok(Box::new(MyEguiApp::new(cc)))),
     )
     .unwrap();
-    println!("ByBye");
 
     Ok(())
 }
@@ -76,23 +108,12 @@ fn main() -> anyhow::Result<()> {
 //     umap: Option<Py<PyAny>>,
 // }
 
-#[derive(Debug, Clone)]
+#[derive(Default, Debug, Clone)]
 struct SemanticQuery {
     text: String,
-    embed_model: EmbeddingModel,
+    embed_model: Option<EmbeddingModel>,
     matched_ids: Arc<BTreeMap<String, f32>>,
     query_point: Option<(f64, f64)>,
-}
-
-impl Default for SemanticQuery {
-    fn default() -> Self {
-        Self {
-            text: Default::default(),
-            embed_model: EmbeddingModel::AllMiniLML6V2Q,
-            matched_ids: Default::default(),
-            query_point: Default::default(),
-        }
-    }
 }
 
 #[derive(Default, Debug, Clone)]
@@ -119,7 +140,6 @@ impl AppState {
 
         Self {
             umap_df,
-            embed_dims: 384,
             ..Default::default()
         }
     }
@@ -194,6 +214,15 @@ impl MyEguiApp {
         let task_count = self.task_count.clone();
         let umap_lock = self.umap.clone();
 
+        let (collection_name, model_id) = if let Ok(app_state) = self.app_state.lock() {
+            (
+                app_state.collection_name.clone(),
+                app_state.semantic.embed_model.clone(),
+            )
+        } else {
+            return;
+        };
+
         let collection_name = if let Ok(app_state) = self.app_state.lock() {
             app_state.collection_name.clone()
         } else {
@@ -211,6 +240,44 @@ impl MyEguiApp {
         task_count.fetch_add(1, Ordering::Relaxed);
 
         self.rt.handle().spawn(async move {
+            // TODO: lazy
+            let anchor_embeds = rt
+                .spawn_blocking({
+                    move || {
+                        if ANCHOR_QUERIES.is_empty() {
+                            return Default::default();
+                        }
+
+                        let model = model_id.and_then(|m| {
+                            TextEmbedding::try_new(
+                                fastembed::InitOptions::new(m)
+                                    .with_show_download_progress(true)
+                                    .with_cache_dir(FASTEMBED_CACHE_DIR.as_str().into()),
+                            )
+                            .ok()
+                        });
+
+                        let embeddings =
+                            model.and_then(|m| m.embed(ANCHOR_QUERIES.clone(), None).ok());
+
+                        embeddings.unwrap_or_default()
+                    }
+                })
+                .await
+                .unwrap_or_default();
+
+            let anchor_df = {
+                let points = anchor_embeds
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (format!("anchor_{i:04}"), v))
+                    .collect();
+                anchor_embeds
+                    .first()
+                    .map(|a| a.len())
+                    .map(|dims| points_to_dataframe(dims, points))
+            };
+
             let resp = qdclient
                 .scroll(
                     ScrollPointsBuilder::new(collection_name.as_str())
@@ -261,7 +328,7 @@ impl MyEguiApp {
                     task_count.fetch_add(1, Ordering::Relaxed);
 
                     move || {
-                        let df_proj = project_embeddings(umap_lock, df);
+                        let df_proj = project_embeddings(umap_lock, df, anchor_df);
 
                         if let Ok(mut app_state) = app_lock.lock() {
                             app_state.umap_df = df_proj;
@@ -276,6 +343,30 @@ impl MyEguiApp {
 
             task_count.fetch_sub(1, Ordering::Relaxed);
         });
+    }
+
+    fn remap_anchors(&mut self) {
+        let model_id = if let Ok(app_state) = self.app_state.lock() {
+            app_state.semantic.embed_model.clone()
+        } else {
+            return;
+        };
+
+        if ANCHOR_QUERIES.is_empty() {
+            // Nothing to do
+            return;
+        }
+
+        if model_id.is_none() {
+            log::info!("No embedding model");
+            return;
+        }
+
+        if let Ok(mut umap) = self.umap.lock() {
+            *umap = None;
+        }
+
+        self.refresh_points();
     }
 
     fn trigger_semantic_query(&self) {
@@ -296,18 +387,24 @@ impl MyEguiApp {
             return;
         };
 
+        if model_id.is_none() {
+            log::info!("No embedding model");
+            return;
+        }
+
         if query_string.is_empty() {
             log::info!("No query");
             return;
         }
+
         if collection_name.is_none() {
             log::info!("No collection selected. Skipping");
             return;
         }
 
-        log::info!("Running query with {model_id}");
-
+        let model_id = model_id.unwrap();
         let collection_name = collection_name.unwrap();
+        log::info!("Running query with {model_id}");
 
         self.rt.handle().spawn(async move {
             task_count.fetch_add(2, Ordering::Relaxed);
@@ -318,7 +415,9 @@ impl MyEguiApp {
                     let task_count = task_count.clone();
                     move || {
                         let model = TextEmbedding::try_new(
-                            fastembed::InitOptions::new(model_id).with_show_download_progress(true),
+                            fastembed::InitOptions::new(model_id)
+                                .with_show_download_progress(true)
+                                .with_cache_dir(FASTEMBED_CACHE_DIR.as_str().into()),
                         )
                         .unwrap();
 
@@ -407,176 +506,187 @@ impl MyEguiApp {
         });
     }
 
-    fn render_inspector(&mut self, ui: &mut egui::Ui) -> anyhow::Result<()> {
+    fn render_explorer(&mut self, ui: &mut egui::Ui) -> anyhow::Result<()> {
         let embed_dims = if let Ok(app_state) = self.app_state.lock() {
             app_state.embed_dims
         } else {
             0
         };
 
-        egui::SidePanel::left("Left panel")
-            // .resizable(false)
-            .default_width(300.0)
-            .show_inside(ui, |ui| {
-                Frame::new().inner_margin(8.0).show(ui, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_enabled_ui(self.task_count.load(Ordering::Relaxed) < 1, |ui| {
-                            if ui.button("Refresh").clicked() {
-                                self.refresh_points();
-                            }
-                        });
-                    });
-                });
-
-                // ui.separator();
-
-                ui.vertical_centered_justified(|ui| {
-                    ui.group(|ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.heading("Query");
-                        });
-
-                        let want_semantic_query = ui
-                            .add_enabled_ui(self.task_count.load(Ordering::Relaxed) < 1, |ui| {
-                                let mut app_state = self.app_state.lock().unwrap();
-                                let semantic = &mut app_state.semantic;
-
-                                if !is_valid_embedding(embed_dims, semantic.embed_model.clone()) {
-                                    semantic.embed_model = valid_embeddings(embed_dims)
-                                        .first()
-                                        .map(|m| m.model.clone())
-                                        .unwrap();
-                                }
-
-                                let start_query = semantic.text.clone();
-                                let start_model = semantic.embed_model.clone();
-
-                                let display_model =
-                                    TextEmbedding::get_model_info(&semantic.embed_model)
-                                        .map(|it| it.model_code.as_str())
-                                        .unwrap_or_default();
-
-                                egui::ComboBox::from_id_salt("embed_model")
-                                    .selected_text(display_model)
-                                    .width(ui.available_width())
-                                    .truncate()
-                                    .show_ui(ui, |ui| {
-                                        for model in valid_embeddings(embed_dims).iter() {
-                                            ui.selectable_value(
-                                                &mut semantic.embed_model,
-                                                model.model.clone(),
-                                                model.model_code.as_str(),
-                                            )
-                                            .on_hover_text(model.description.as_str());
-                                        }
-                                    });
-
-                                start_model != semantic.embed_model
-                                    || ui.input(|i| {
-                                        i.modifiers.ctrl && i.key_pressed(egui::Key::Enter)
-                                    })
-                                    || (ui.text_edit_multiline(&mut semantic.text).lost_focus()
-                                        && start_query != semantic.text)
-                            })
-                            .inner;
-
-                        if want_semantic_query {
-                            self.trigger_semantic_query();
-                        }
-
-                        // Grid does not honor justification
-                        // TODO: try the table in egui_extras instead
-                        egui::Grid::new("semantic_matches")
-                            .num_columns(2)
-                            .striped(true)
-                            .show(ui, |ui| {
-                                let mut app_state = self.app_state.lock().unwrap();
-                                let matched_ids = app_state.semantic.matched_ids.clone();
-                                let selected = &mut app_state.select_point;
-
-                                let matched_ids = matched_ids
-                                    .iter()
-                                    .sorted_by(|(_, v0), (_, v1)| v1.total_cmp(v0));
-
-                                for (id, score) in matched_ids {
-                                    // Instead of truncating during resize, this is forcing the minimum
-                                    // width to the size of the UUID + scores. None of the other
-                                    // techniques below help.
-                                    ui.selectable_value(selected, Some(id.clone()), id.clone());
-
-                                    // let job = LayoutJob::simple_singleline(
-                                    //     id.to_string(),
-                                    //     TextStyle::Button.resolve(ui.style()),
-                                    //     Color32::GREEN, // How to get current text color from ui?
-                                    // );
-
-                                    // Still doesn't truncate
-                                    // let mut job = LayoutJob::default();
-                                    // let format = TextFormat {
-                                    //     font_id: TextStyle::Button.resolve(ui.style()),
-                                    //     ..Default::default()
-                                    // };
-                                    // job.append(id, 0.0, format);
-                                    // job.wrap = TextWrapping {
-                                    //     max_rows: 1,
-                                    //     break_anywhere: true,
-                                    //     ..Default::default()
-                                    // };
-
-                                    // Truncates but at minimum size instead of available width
-                                    // ui.style_mut().wrap_mode = Some(TextWrapMode::Truncate);
-
-                                    // ui.selectable_value(selected, Some(id.clone()), job);
-
-                                    // Expanded versions do no better...
-                                    // let label =
-                                    //     egui::SelectableLabel::new(selected.as_ref() == Some(id), job);
-                                    //
-                                    // if ui.add(label).clicked() {
-                                    //     *selected = Some(id.clone());
-                                    // }
-                                    // if ui
-                                    //     .selectable_label(hover_point.as_ref() == Some(id), job)
-                                    //     .clicked()
-                                    // {
-                                    //     app_state.hover_point = Some(id.clone());
-                                    // }
-
-                                    // This is the only variant that truncates properly in this context,
-                                    // but then we lose selectability.
-                                    // ui.add(egui::Label::new(id).truncate());
-
-                                    ui.label(score.to_string());
-                                    ui.end_row();
-                                }
-                            });
-                    });
-                });
-
-                ui.group(|ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.heading("Details");
-                    });
-
-                    ScrollArea::vertical().show(ui, |ui| {
-                        ui.vertical(|ui| {
-                            let app_state = self.app_state.lock().unwrap();
-                            for (k, v) in &app_state.point_details {
-                                CollapsingHeader::new(k).default_open(v.len() < 128).show(
-                                    ui,
-                                    |ui| {
-                                        ui.label(v);
-                                    },
-                                );
-                            }
-
-                            // Add an extra line to prevent clipping on long text
-                            let font_id = egui::TextStyle::Body.resolve(ui.style());
-                            ui.add_space(font_id.size / 2.0);
-                        });
-                    });
+        Frame::new().inner_margin(8.0).show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_enabled_ui(self.task_count.load(Ordering::Relaxed) < 1, |ui| {
+                    if ui.button("Refresh").clicked() {
+                        self.refresh_points();
+                    }
                 });
             });
+        });
+
+        // ui.separator();
+
+        ui.vertical(|ui| {
+            // ui.group(|ui| {
+            // ui.vertical_centered(|ui| {
+            //     ui.heading("Query");
+            // });
+
+            let (model_changed, want_semantic_query) = ui
+                .add_enabled_ui(self.task_count.load(Ordering::Relaxed) < 1, |ui| {
+                    let mut app_state = self.app_state.lock().unwrap();
+                    let semantic = &mut app_state.semantic;
+
+                    let start_query = semantic.text.clone();
+                    let start_model = semantic.embed_model.clone();
+
+                    let display_model = semantic
+                        .embed_model
+                        .as_ref()
+                        .and_then(|m| TextEmbedding::get_model_info(m).ok())
+                        .map(|m| m.model_code.as_str())
+                        .unwrap_or_default();
+
+                    ui.label("Embedding model");
+                    egui::ComboBox::from_id_salt("embed_model")
+                        .selected_text(display_model)
+                        .width(ui.available_width())
+                        .truncate()
+                        .show_ui(ui, |ui| {
+                            for model in valid_embeddings(embed_dims).iter() {
+                                ui.selectable_value(
+                                    &mut semantic.embed_model,
+                                    Some(model.model.clone()),
+                                    model.model_code.as_str(),
+                                )
+                                .on_hover_text(model.description.as_str());
+                            }
+                        });
+
+                    // ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                    //     ui.button("Anchors");
+                    // });
+
+                    ui.add_space(8.0);
+
+                    ui.label("Query");
+                    let query_box = ui.vertical_centered_justified(|ui| {
+                        // TODO: resizable
+                        ui.text_edit_multiline(&mut semantic.text)
+                    });
+
+                    let model_changed = start_model != semantic.embed_model;
+
+                    let query_requested = ui
+                        .input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter))
+                        || (query_box.inner.lost_focus() && start_query != semantic.text);
+
+                    (model_changed, model_changed || query_requested)
+                })
+                .inner;
+
+            if model_changed {
+                self.remap_anchors();
+            }
+
+            if want_semantic_query {
+                self.trigger_semantic_query();
+            }
+
+            // Grid does not honor justification
+            // TODO: try the table in egui_extras instead
+            egui::Grid::new("semantic_matches")
+                .num_columns(2)
+                .striped(true)
+                .show(ui, |ui| {
+                    let mut app_state = self.app_state.lock().unwrap();
+                    let matched_ids = app_state.semantic.matched_ids.clone();
+                    let selected = &mut app_state.select_point;
+
+                    let matched_ids = matched_ids
+                        .iter()
+                        .sorted_by(|(_, v0), (_, v1)| v1.total_cmp(v0));
+
+                    for (id, score) in matched_ids {
+                        // Instead of truncating during resize, this is forcing the minimum
+                        // width to the size of the UUID + scores. None of the other
+                        // techniques below help.
+                        ui.selectable_value(selected, Some(id.clone()), id.clone());
+
+                        // let job = LayoutJob::simple_singleline(
+                        //     id.to_string(),
+                        //     TextStyle::Button.resolve(ui.style()),
+                        //     Color32::GREEN, // How to get current text color from ui?
+                        // );
+
+                        // Still doesn't truncate
+                        // let mut job = LayoutJob::default();
+                        // let format = TextFormat {
+                        //     font_id: TextStyle::Button.resolve(ui.style()),
+                        //     ..Default::default()
+                        // };
+                        // job.append(id, 0.0, format);
+                        // job.wrap = TextWrapping {
+                        //     max_rows: 1,
+                        //     break_anywhere: true,
+                        //     ..Default::default()
+                        // };
+
+                        // Truncates but at minimum size instead of available width
+                        // ui.style_mut().wrap_mode = Some(TextWrapMode::Truncate);
+
+                        // ui.selectable_value(selected, Some(id.clone()), job);
+
+                        // Expanded versions do no better...
+                        // let label =
+                        //     egui::SelectableLabel::new(selected.as_ref() == Some(id), job);
+                        //
+                        // if ui.add(label).clicked() {
+                        //     *selected = Some(id.clone());
+                        // }
+                        // if ui
+                        //     .selectable_label(hover_point.as_ref() == Some(id), job)
+                        //     .clicked()
+                        // {
+                        //     app_state.hover_point = Some(id.clone());
+                        // }
+
+                        // This is the only variant that truncates properly in this context,
+                        // but then we lose selectability.
+                        // ui.add(egui::Label::new(id).truncate());
+
+                        ui.label(score.to_string());
+                        ui.end_row();
+                    }
+                });
+            // });
+        });
+
+        Ok(())
+    }
+
+    fn render_inspector(&mut self, ui: &mut egui::Ui) -> anyhow::Result<()> {
+        // ui.group(|ui| {
+        ui.vertical_centered(|ui| {
+            ui.heading("Details");
+        });
+
+        ScrollArea::vertical().show(ui, |ui| {
+            ui.vertical(|ui| {
+                let app_state = self.app_state.lock().unwrap();
+                for (k, v) in &app_state.point_details {
+                    CollapsingHeader::new(k)
+                        .default_open(v.len() < 128)
+                        .show(ui, |ui| {
+                            ui.label(v);
+                        });
+                }
+
+                // Add an extra line to prevent clipping on long text
+                let font_id = egui::TextStyle::Body.resolve(ui.style());
+                ui.add_space(font_id.size / 2.0);
+            });
+        });
+        // });
         Ok(())
     }
 
@@ -711,11 +821,17 @@ impl MyEguiApp {
 
                 rt.spawn(async move {
                     task_count.fetch_add(1, Ordering::Relaxed);
+
+                    // Not ideal. We really should be tracking the type in the dataframe column,
+                    // but acceptable for non-critical code.
+                    let point_id: PointId = uuid
+                        .as_str()
+                        .parse::<u64>()
+                        .map(|f| f.into())
+                        .unwrap_or_else(|_| uuid.as_str().into());
+                    let request = GetPointsBuilder::new(collection_name.as_str(), vec![point_id]);
                     let resp = qdclient
-                        .get_points(
-                            GetPointsBuilder::new(collection_name.as_str(), vec![uuid.into()])
-                                .with_payload(true),
-                        )
+                        .get_points(request.with_payload(true))
                         .await
                         .unwrap();
 
@@ -737,6 +853,138 @@ impl MyEguiApp {
         });
         Ok(())
     }
+
+    fn render_navbar(&mut self, ui: &mut egui::Ui) {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+            Frame::new().inner_margin(8.0).show(ui, |ui| {
+                // ui.horizontal(|ui| {
+                // ui.label(RichText::new("Collection").heading().strong());
+                let enabled = self.task_count.load(Ordering::Relaxed) < 1;
+                let (collections, start_value) = {
+                    let app_state = self.app_state.lock().unwrap();
+                    (
+                        app_state.available_collections.clone(),
+                        app_state.collection_name.clone(),
+                    )
+                };
+
+                let mut dummy = start_value.clone();
+
+                ui.add_enabled_ui(enabled, |ui| {
+                    let resp = egui::ComboBox::from_label("Collection")
+                        .selected_text(
+                            RichText::new(start_value.as_ref().unwrap_or(&"".to_string())).strong(),
+                        )
+                        // .width(ui.available_width())
+                        // .truncate()
+                        .show_ui(ui, |ui| {
+                            for name in collections.iter() {
+                                ui.selectable_value(&mut dummy, Some(name.to_string()), name);
+                            }
+
+                            start_value != dummy
+                        });
+
+                    if resp.inner.unwrap_or(false) {
+                        if let Ok(mut app_state) = self.app_state.lock() {
+                            *app_state = AppState::new();
+                            app_state.collection_name = dummy;
+                        }
+
+                        if let Ok(mut umap) = self.umap.lock() {
+                            *umap = None;
+                        }
+
+                        self.refresh_points();
+                        self.refresh_collections();
+                    }
+                });
+            });
+            // });
+        });
+    }
+
+    fn render_status_line(&mut self, ui: &mut egui::Ui) {
+        ui.columns(3, |cols| {
+            // TODO: Settings modal dialog
+            cols[0].horizontal(|_| {
+                // if ui.button("⚙").clicked() {
+                //     log::warn!("Not implemented!");
+                // }
+            });
+            cols[1].horizontal(|ui| {
+                // TODO: only calculate this on change
+                let num_points = self.app_state.lock().ok().map(|s| s.umap_df.height());
+                if let Some(count) = num_points {
+                    ui.label(format!("{count} points"));
+                }
+            });
+            cols[2].with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if self.task_count.load(Ordering::Relaxed) > 0 {
+                    ui.spinner();
+                    ui.label("Loading");
+                } else {
+                    let builder = UiBuilder::new()
+                        .id_salt("ready_refresh_widget")
+                        .sense(Sense::click());
+                    let scoped = ui.scope_builder(builder, |ui| {
+                        let size = egui::Vec2::splat(18.0);
+                        let (response, painter) = ui.allocate_painter(size, Sense::hover());
+                        let rect = response.rect;
+                        painter.circle_filled(rect.center(), 6.0, Color32::from_rgb(100, 200, 100));
+                    });
+
+                    if scoped.response.clicked() {
+                        self.refresh_points();
+                    }
+
+                    scoped.response.on_hover_text("Refresh data");
+
+                    ui.label("Ready");
+                }
+            });
+        });
+    }
+}
+
+impl eframe::App for MyEguiApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::TopBottomPanel::top("Header").show_inside(ui, |ui| {
+                self.render_navbar(ui);
+            });
+
+            egui::SidePanel::left("Explorer")
+                // .resizable(false)
+                .default_width(300.0)
+                .show_inside(ui, |ui| {
+                    self.render_explorer(ui).unwrap();
+
+                    //     });
+                    // egui::SidePanel::right("Inspector")
+                    //     // .resizable(false)
+                    //     .default_width(300.0)
+                    //     .show_inside(ui, |ui| {
+
+                    ui.separator();
+
+                    self.render_inspector(ui).unwrap();
+                });
+
+            self.render_plot(ui).unwrap();
+        });
+        egui::TopBottomPanel::bottom("Footer").show(ctx, |ui| {
+            self.render_status_line(ui);
+        });
+    }
+}
+
+fn extract_f64(df: &DataFrame, colname: &str) -> Result<Float64Chunked> {
+    Ok(df
+        .column(colname)?
+        .cast(&DataType::Float64)?
+        .f64()?
+        .to_owned())
 }
 
 async fn refresh_collection_info(app_state: Arc<Mutex<AppState>>, qdclient: Arc<Qdrant>) {
@@ -768,6 +1016,9 @@ async fn refresh_collection_info(app_state: Arc<Mutex<AppState>>, qdclient: Arc<
 #[cached]
 fn valid_embeddings(embed_dims: usize) -> Arc<Vec<fastembed::ModelInfo<EmbeddingModel>>> {
     let all_embeddings = TextEmbedding::list_supported_models();
+    if embed_dims == 0 {
+        return Arc::new(all_embeddings);
+    }
 
     Arc::new(
         all_embeddings
@@ -783,13 +1034,13 @@ fn valid_embeddings(embed_dims: usize) -> Arc<Vec<fastembed::ModelInfo<Embedding
     )
 }
 
-#[cached]
-fn is_valid_embedding(embed_dims: usize, embedding_model: EmbeddingModel) -> bool {
-    valid_embeddings(embed_dims)
-        .iter()
-        .map(|m| m.model.clone())
-        .contains(&embedding_model)
-}
+// #[cached]
+// fn is_valid_embedding(embed_dims: usize, embedding_model: EmbeddingModel) -> bool {
+//     valid_embeddings(embed_dims)
+//         .iter()
+//         .map(|m| m.model.clone())
+//         .contains(&embedding_model)
+// }
 
 /// Create a lookup table of `egui::Ids` to UUIDs for determining which entry has mouse focus.
 fn points_to_hover_lookup(point_vecs: &Vec<(String, &Vec<f32>)>) -> HashMap<egui::Id, String> {
@@ -815,10 +1066,12 @@ fn points_to_hover_lookup(point_vecs: &Vec<(String, &Vec<f32>)>) -> HashMap<egui
 /// * `df` - a DataFrame where each column is an embedding dimension
 /// # Returns
 /// * A new DataFrame containing the points project onto a 2-D plane
-fn project_embeddings(umap: Arc<Mutex<Option<Py<PyAny>>>>, df: DataFrame) -> DataFrame {
+fn project_embeddings(
+    umap: Arc<Mutex<Option<Py<PyAny>>>>,
+    df: DataFrame,
+    anchors: Option<DataFrame>,
+) -> DataFrame {
     let x_umap = Python::with_gil(|py| {
-        let df = df.drop("uuid").unwrap();
-
         let mut umap_guard = umap.lock().unwrap();
 
         let umap = match umap_guard.as_ref() {
@@ -838,15 +1091,21 @@ fn project_embeddings(umap: Arc<Mutex<Option<Py<PyAny>>>>, df: DataFrame) -> Dat
                     )
                     .unwrap();
 
-                let umap = umap
-                    .call_method1("fit", (PyDataFrame(df.clone()),))
-                    .unwrap();
+                let df = if let Some(anchor_df) = anchors {
+                    dbg!(anchor_df.vstack(&df)).unwrap()
+                } else {
+                    df.clone()
+                };
+
+                let df = df.drop("uuid").unwrap();
+                let umap = umap.call_method1("fit", (PyDataFrame(df),)).unwrap();
 
                 *umap_guard = Some(umap.clone().unbind());
                 umap
             }
         };
 
+        let df = df.drop("uuid").unwrap();
         let x_u = umap
             .call_method1("transform", (PyDataFrame(df.clone()),))
             .unwrap();
@@ -890,121 +1149,4 @@ fn points_to_dataframe(embed_dims: usize, point_vecs: Vec<(String, &Vec<f32>)>) 
         df.with_column(ser).unwrap();
     }
     df
-}
-
-impl eframe::App for MyEguiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::TopBottomPanel::top("Header").show_inside(ui, |ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                    Frame::new().inner_margin(8.0).show(ui, |ui| {
-                        // ui.horizontal(|ui| {
-                        // ui.label(RichText::new("Collection").heading().strong());
-                        let enabled = self.task_count.load(Ordering::Relaxed) < 1;
-                        let (collections, start_value) = {
-                            let app_state = self.app_state.lock().unwrap();
-                            (
-                                app_state.available_collections.clone(),
-                                app_state.collection_name.clone(),
-                            )
-                        };
-
-                        let mut dummy = start_value.clone();
-
-                        ui.add_enabled_ui(enabled, |ui| {
-                            let resp = egui::ComboBox::from_label("Collection")
-                                .selected_text(
-                                    RichText::new(start_value.as_ref().unwrap_or(&"".to_string()))
-                                        .strong(),
-                                )
-                                // .width(ui.available_width())
-                                // .truncate()
-                                .show_ui(ui, |ui| {
-                                    for name in collections.iter() {
-                                        ui.selectable_value(
-                                            &mut dummy,
-                                            Some(name.to_string()),
-                                            name,
-                                        );
-                                    }
-
-                                    start_value != dummy
-                                });
-
-                            if resp.inner.unwrap_or(false) {
-                                if let Ok(mut app_state) = self.app_state.lock() {
-                                    *app_state = AppState::new();
-                                    app_state.collection_name = dummy;
-                                }
-
-                                if let Ok(mut umap) = self.umap.lock() {
-                                    *umap = None;
-                                }
-
-                                self.refresh_points();
-                                self.refresh_collections();
-                            }
-                        });
-                    });
-                    // });
-                });
-            });
-
-            self.render_inspector(ui).unwrap();
-            self.render_plot(ui).unwrap();
-        });
-        egui::TopBottomPanel::bottom("Footer").show(ctx, |ui| {
-            ui.columns(3, |cols| {
-                // TODO: Settings modal dialog
-                cols[0].horizontal(|_| {
-                    // if ui.button("⚙").clicked() {
-                    //     log::warn!("Not implemented!");
-                    // }
-                });
-                cols[1].horizontal(|ui| {
-                    // TODO: only calculate this on change
-                    let num_points = self.app_state.lock().ok().map(|s| s.umap_df.height());
-                    if let Some(count) = num_points {
-                        ui.label(format!("{count} points"));
-                    }
-                });
-                cols[2].with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if self.task_count.load(Ordering::Relaxed) > 0 {
-                        ui.spinner();
-                        ui.label("Loading");
-                    } else {
-                        let builder = UiBuilder::new()
-                            .id_salt("ready_refresh_widget")
-                            .sense(Sense::click());
-                        let scoped = ui.scope_builder(builder, |ui| {
-                            let size = egui::Vec2::splat(18.0);
-                            let (response, painter) = ui.allocate_painter(size, Sense::hover());
-                            let rect = response.rect;
-                            painter.circle_filled(
-                                rect.center(),
-                                6.0,
-                                Color32::from_rgb(100, 200, 100),
-                            );
-                        });
-
-                        if scoped.response.clicked() {
-                            self.refresh_points();
-                        }
-
-                        scoped.response.on_hover_text("Refresh data");
-
-                        ui.label("Ready");
-                    }
-                });
-            });
-        });
-    }
-}
-
-fn extract_f64(df: &DataFrame, colname: &str) -> Result<Float64Chunked> {
-    Ok(df
-        .column(colname)?
-        .cast(&DataType::Float64)?
-        .f64()?
-        .to_owned())
 }
