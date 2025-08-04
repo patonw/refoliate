@@ -1,3 +1,10 @@
+# The app only queries with a depth of 1 level. By default, all patterns are rooted to the top-level.
+# To recurse into a module/namespace/etc. an element must set the `recurse` directive.
+#
+# For instance, function patterns will only match free functions at the top level. To match methods,
+# you should create a class/impl/etc. pattern that includes methods in its definition list. However,
+# to match functions inside a namespace, you would create a namespace pattern with the recurse directive,
+# but no explicit function patterns inside.
 javascript:
   extensions:
     - js
@@ -48,8 +55,6 @@ rust:
     - rs
   grammar_path: https://github.com/tree-sitter/tree-sitter-rust/releases/download/v0.24.0/tree-sitter-rust.wasm
   queries:
-    # TODO: don't process associated member and associated type defs inside traits individually
-    # TODO: How do we determine the surrounding class for a method?
     traits: |
       (trait_item
           name: (type_identifier) @name.definition.interface) @definition.interface
@@ -66,6 +71,31 @@ rust:
     functions: |
       (function_item
           name: (identifier) @name.definition.function) @definition.function
+
+    methods: |
+      (impl_item
+          trait: (type_identifier) @name.reference.interface
+          type: (type_identifier) @name.reference.class
+          body: (declaration_list
+              (function_item
+                  name: (identifier) @name.definition.method) @definition.method
+          )
+      )
+
+      (impl_item
+          type: (type_identifier) @name.reference.class
+          !trait
+          body: (declaration_list
+              (function_item
+                  name: (identifier) @name.definition.method) @definition.method
+          )
+      )
+
+    modules: |
+      (mod_item
+          name: (identifier) @name.definition.module
+          body: (declaration_list)
+          (#set! recurse)) @definition.module
 
 #      #### Seems to overlap with functions. Need to check tree-sitter docs
 #      methods: |

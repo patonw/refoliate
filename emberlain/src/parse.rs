@@ -84,6 +84,7 @@ impl<'a> Breadloaf<'a> {
 
 pub type MatchStack<'a> = Vec<Arc<Breadcrumb<'a>>>;
 
+#[derive(Debug)]
 pub enum MatchQueueItem<'a> {
     Node(Node<'a>),
     Breadcrumb(Arc<Breadcrumb<'a>>),

@@ -114,6 +114,7 @@ async fn main() -> Result<()> {
                 }
             })
             .await?;
+
         Ok(()) as anyhow::Result<()>
     });
 

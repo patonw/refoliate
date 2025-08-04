@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use cached_path::cached_path;
 use ignore::Walk;
 use itertools::Itertools;
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -116,7 +117,7 @@ impl SourceWalker {
         path: P,
         cb: &impl AsyncFn(&FileMatchArgs, &NodeMatchArgs),
     ) -> Result<()> {
-        self.walk_directory(path, async move |file_match| {
+        self.walk_directory(path, &async move |file_match| {
             let root = file_match.tree.root_node().child(0).expect("File is empty");
 
             crate::parse::process_node(
@@ -140,7 +141,7 @@ impl SourceWalker {
         for item in Walk::new(path) {
             match item {
                 Ok(entry) if entry.path().is_file() => {
-                    tracing::debug!("{entry:?} ext: {:?}", entry.path().extension());
+                    debug!("{entry:?} ext: {:?}", entry.path().extension());
 
                     if let Some(file_ext) = entry.path().extension().and_then(|x| x.to_str()) {
                         let snipper = self.snipper_for(file_ext).await;
@@ -158,7 +159,7 @@ impl SourceWalker {
                                 .ok_or(anyhow!("Could not parse"))?;
 
                             let mut qc = QueryCursor::new();
-                            tracing::info!("Query {query:?}, {}", qc.match_limit());
+                            info!("Query {query:?}, {}", qc.match_limit());
 
                             let mut ms =
                                 qc.matches(query, tree.root_node(), source_code.as_slice());
@@ -169,8 +170,8 @@ impl SourceWalker {
                         }
                     }
                 }
-                Err(err) => tracing::warn!("Error: {err}"),
-                it => tracing::debug!("Skipping {it:?}"),
+                Err(err) => warn!("Error: {err}"),
+                it => debug!("Skipping {it:?}"),
             }
         }
         Ok(())
@@ -179,12 +180,12 @@ impl SourceWalker {
     pub async fn walk_directory<P: AsRef<Path>>(
         &mut self,
         path: P,
-        cb: impl AsyncFn(FileMatchArgs),
+        cb: &impl AsyncFn(FileMatchArgs),
     ) -> Result<()> {
         for item in Walk::new(path) {
             match item {
                 Ok(entry) if entry.path().is_file() => {
-                    tracing::debug!("{entry:?} ext: {:?}", entry.path().extension());
+                    debug!("{entry:?} ext: {:?}", entry.path().extension());
 
                     if let Some(file_ext) = entry.path().extension().and_then(|x| x.to_str()) {
                         let snipper = self.snipper_for(file_ext).await;
@@ -211,8 +212,8 @@ impl SourceWalker {
                         }
                     }
                 }
-                Err(err) => tracing::warn!("Error: {err}"),
-                it => tracing::debug!("Skipping {it:?}"),
+                Err(err) => warn!("Error: {err}"),
+                it => debug!("Skipping {it:?}"),
             }
         }
         Ok(())
@@ -264,7 +265,7 @@ mod tests {
             .ok_or(anyhow!("Could not parse"))?;
 
         let mut qc = QueryCursor::new();
-        tracing::info!("Query {query:?}, {}", qc.match_limit());
+        info!("Query {query:?}, {}", qc.match_limit());
 
         let mut ms = qc.matches(query, tree.root_node(), source_code);
         let item = ms.next().expect("something should have matched");
