@@ -1,19 +1,23 @@
 use anyhow::{Result, anyhow};
 use cached_path::cached_path;
-use ignore::Walk;
+use ignore::types::TypesBuilder;
+use ignore::{Walk, WalkBuilder};
 use itertools::Itertools;
-use log::{debug, info, warn};
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
-use tree_sitter::{Language, Parser, Query, QueryCursor, WasmStore, wasmtime::Engine};
-use tree_sitter::{QueryMatch, StreamingIterator};
+use tree_sitter::Tree;
+use tree_sitter::{Language, Parser, Query, WasmStore, wasmtime::Engine};
 
 use tokio::task;
 
-use crate::parse::cb::{FileMatchArgs, NodeMatchArgs};
+use crate::parse::cb::FileMatchArgs;
+
+pub type ParsedFile = (Vec<u8>, Tree, Arc<Query>);
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LanguageSpec {
@@ -27,7 +31,7 @@ pub struct CodeSnipper {
     pub name: String,
     pub blob: Language,
     pub parser: Parser,
-    pub query: Query,
+    pub query: Arc<Query>,
 }
 
 #[derive(Default)]
@@ -78,7 +82,7 @@ impl SourceWalker {
         parser.set_language(&language)?;
 
         let query = lang_spec.queries.values().join("\n");
-        let query = Query::new(&language, &query)?;
+        let query = Arc::new(Query::new(&language, &query)?);
 
         Ok(CodeSnipper {
             name: lang_name.clone(),
@@ -88,7 +92,7 @@ impl SourceWalker {
         })
     }
 
-    pub async fn snipper_for(&mut self, file_ext: &str) -> Result<&mut CodeSnipper> {
+    pub async fn snipper_for_ext(&mut self, file_ext: &str) -> Result<&mut CodeSnipper> {
         let lang_name = self
             .ext_to_lang
             .get(file_ext)
@@ -111,72 +115,15 @@ impl SourceWalker {
             .ok_or(anyhow!("Could not retrieve processor for {file_ext}"))
     }
 
-    #[deprecated(note = "use walk_directory and invoke process_node instead")]
-    pub async fn process_directory<P: AsRef<Path>>(
-        &mut self,
-        path: P,
-        cb: &impl AsyncFn(&FileMatchArgs, &NodeMatchArgs),
-    ) -> Result<()> {
-        self.walk_directory(path, &async move |file_match| {
-            let root = file_match.tree.root_node().child(0).expect("File is empty");
-
-            crate::parse::process_node(
-                root,
-                file_match.source,
-                file_match.query,
-                vec![],
-                &async move |node_match| cb(&file_match, &node_match).await,
-            )
-            .await;
-        })
-        .await
-    }
-
-    #[deprecated(note = "use walk_directory and invoke process_node instead")]
-    pub async fn aprocess_directory<P: AsRef<Path>>(
-        &mut self,
-        path: P,
-        cb: impl AsyncFn(&Path, &Query, &QueryMatch, &[u8]),
-    ) -> Result<()> {
-        for item in Walk::new(path) {
-            match item {
-                Ok(entry) if entry.path().is_file() => {
-                    debug!("{entry:?} ext: {:?}", entry.path().extension());
-
-                    if let Some(file_ext) = entry.path().extension().and_then(|x| x.to_str()) {
-                        let snipper = self.snipper_for(file_ext).await;
-
-                        if let Ok(snipper) = snipper {
-                            let parser = &mut snipper.parser;
-                            let query = &snipper.query;
-
-                            let mut source_code: Vec<u8> = Vec::new();
-                            let mut fh = File::open(entry.path()).await?;
-                            fh.read_to_end(&mut source_code).await?;
-
-                            let tree = parser
-                                .parse(&source_code, None)
-                                .ok_or(anyhow!("Could not parse"))?;
-
-                            let mut qc = QueryCursor::new();
-                            info!("Query {query:?}, {}", qc.match_limit());
-
-                            let mut ms =
-                                qc.matches(query, tree.root_node(), source_code.as_slice());
-
-                            while let Some(n) = ms.next() {
-                                cb(entry.path(), query, n, &source_code).await;
-                            }
-                        }
-                    }
-                }
-                Err(err) => warn!("Error: {err}"),
-                it => debug!("Skipping {it:?}"),
-            }
+    pub async fn snipper_for_path(&mut self, path: impl AsRef<Path>) -> Result<&mut CodeSnipper> {
+        if let Some(file_ext) = path.as_ref().extension().and_then(|x| x.to_str()) {
+            self.snipper_for_ext(file_ext).await
+        } else {
+            Err(anyhow!("Could not determine extension"))
         }
-        Ok(())
     }
 
+    #[deprecated(note = "Use iter_repo instead and filter directories")]
     pub async fn walk_directory<P: AsRef<Path>>(
         &mut self,
         path: P,
@@ -188,11 +135,11 @@ impl SourceWalker {
                     debug!("{entry:?} ext: {:?}", entry.path().extension());
 
                     if let Some(file_ext) = entry.path().extension().and_then(|x| x.to_str()) {
-                        let snipper = self.snipper_for(file_ext).await;
+                        let snipper = self.snipper_for_ext(file_ext).await;
 
                         if let Ok(snipper) = snipper {
                             let parser = &mut snipper.parser;
-                            let query = &snipper.query;
+                            let query = snipper.query.as_ref();
 
                             let mut source_code: Vec<u8> = Vec::new();
                             let mut fh = File::open(entry.path()).await?;
@@ -218,6 +165,36 @@ impl SourceWalker {
         }
         Ok(())
     }
+
+    pub fn iter_repo(&mut self, root: impl AsRef<Path>) -> Result<Walk> {
+        let mut types_builder = TypesBuilder::new();
+        for (lang, spec) in &self.languages {
+            for ext in &spec.extensions {
+                types_builder.add(lang, &format!("*.{ext}"))?;
+            }
+
+            types_builder.select(lang);
+        }
+        let types = types_builder.build()?;
+
+        Ok(WalkBuilder::new(root).types(types).build())
+    }
+
+    pub async fn parse_file(&mut self, path: impl AsRef<Path>) -> Result<ParsedFile> {
+        if let Ok(snipper) = self.snipper_for_path(path.as_ref()).await {
+            let mut source_code: Vec<u8> = Vec::new();
+            let mut fh = File::open(path.as_ref()).await?;
+            fh.read_to_end(&mut source_code).await?;
+            let parser = &mut snipper.parser;
+
+            let tree = parser
+                .parse(&source_code, None)
+                .ok_or(anyhow!("Could not parse"))?;
+
+            return Ok((source_code, tree, snipper.query.clone()));
+        }
+        Err(anyhow!("Nope"))
+    }
 }
 
 #[cfg(test)]
@@ -226,6 +203,7 @@ mod tests {
 
     use anyhow::anyhow;
     use googletest::prelude::*;
+    use log::info;
     use textwrap::dedent;
     use tree_sitter::{QueryCursor, StreamingIterator};
 
@@ -250,7 +228,7 @@ mod tests {
         let mut src_walk = SourceWalker::default();
         src_walk.load_languages(&langspec)?;
 
-        let snipper = src_walk.snipper_for("rs").await?;
+        let snipper = src_walk.snipper_for_ext("rs").await?;
         let parser = &mut snipper.parser;
         let query = &snipper.query;
         assert_that!(snipper.name, eq("rust"));
