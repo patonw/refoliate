@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.98"
+async-trait = "0.1.88"
 blake3 = "1.8.2"
 cached-path = "0.8.1"
 clap = { version = "4.5.40", features = ["env", "derive"] }
@@ -13,6 +14,7 @@ dotenvy = { version = "0.15.7", features = ["clap"] }
 env_logger = "0.11.8"
 fastembed = "4.9.1"
 figment = { version = "0.10.19", features = ["env", "toml"] }
+flume = { version = "0.11.1", features = ["async"] }
 ignore = "0.4.23"
 indicatif = "0.18.0"
 indicatif-log-bridge = "0.2.3"
@@ -20,6 +22,7 @@ indoc = "2.0.6"
 itertools = "0.14.0"
 log = "0.4.27"
 qdrant-client.workspace = true
+reqwest = { version = "0.12.22", features = ["json"] }
 rig-core = { version = "0.15.1", features = ["derive"] }
 rig-fastembed = "0.2.1"
 rig-qdrant = "0.1.15"
@@ -43,6 +46,7 @@ tracing-subscriber = { version = "0.3.19", default-features = false, features = 
   "json",
 ] }
 tree-sitter = { version = "0.25.6", features = ["wasm"] }
+typed-builder = "0.21.0"
 uuid = { version = "1.17.0", features = ["v8"] }
 
 [dev-dependencies]

@@ -1,84 +1,59 @@
-use itertools::Itertools;
+use std::sync::Arc;
+
+use fastembed::TextEmbedding;
+use flume::Receiver;
 use log::{info, warn};
 use qdrant_client::{
     Payload, Qdrant,
-    qdrant::{
-        CreateCollectionBuilder, Distance, PointStruct, UpsertPointsBuilder, VectorParamsBuilder,
-    },
+    qdrant::{PointStruct, UpsertPointsBuilder},
 };
-use rig::embeddings::EmbeddingsBuilder;
-use rig_fastembed::Client;
-use tokio::sync::mpsc::Receiver;
-use uuid::Uuid;
+use typed_builder::TypedBuilder;
 
-use crate::{COLLECTION_NAME, CodeSnippet, EMBED_DIMS, EMBED_MODEL};
+use crate::CodeSnippet;
 
-pub async fn embedding_worker(mut summary_rx: Receiver<CodeSnippet>) -> anyhow::Result<()> {
-    // Initialize the Fastembed client
-    let fastembed_client = Client::new();
+#[derive(TypedBuilder)]
+pub struct EmbeddingWorker {
+    embedding: Arc<TextEmbedding>,
+    qdrant: Qdrant,
+    collection: String,
+}
 
-    let embedding_model = fastembed_client.embedding_model(&EMBED_MODEL);
+impl EmbeddingWorker {
+    pub async fn run(&self, receiver: Receiver<CodeSnippet>) -> anyhow::Result<()> {
+        while let Ok(msg) = receiver.recv_async().await {
+            let result = async {
+                let options = textwrap::Options::new(100)
+                    .initial_indent(">.< ")
+                    .subsequent_indent("-.- ");
 
-    let client = Qdrant::from_url("http://localhost:6334").build()?;
-    if !client.collection_exists(COLLECTION_NAME.as_str()).await? {
-        client
-            .create_collection(
-                CreateCollectionBuilder::new(COLLECTION_NAME.as_str()).vectors_config(
-                    VectorParamsBuilder::new(*EMBED_DIMS as u64, Distance::Cosine),
-                ),
-            )
-            .await?;
-    }
+                info!("X.X ID = {:?}", msg.uuid());
+                info!("{}", textwrap::fill(&msg.summary, &options));
 
-    // let query_params = QueryPointsBuilder::new(COLLECTION_NAME.as_str()).with_payload(true);
-    // let vector_store =
-    //     QdrantVectorStore::new(client, embedding_model.clone(), query_params.build());
+                // this could be cleaner
+                let embedding = self
+                    .embedding
+                    .embed(vec![&msg.summary], None)?
+                    .pop()
+                    .unwrap();
 
-    while let Some(msg) = summary_rx.recv().await {
-        let result = async {
-            // println!("Summarized: {msg:?}");
-            let id = u64::from_be_bytes(msg.hash[..8].try_into()?);
-
-            let options = textwrap::Options::new(100)
-                .initial_indent(">.< ")
-                .subsequent_indent("-.- ");
-
-            info!(
-                "X.X ID = {id} HASH = {:?}",
-                blake3::Hash::from_slice(&msg.hash)
-            );
-            info!("{}", textwrap::fill(&msg.summary, &options));
-
-            let documents = EmbeddingsBuilder::new(embedding_model.clone())
-                .document(msg)?
-                .build()
-                .await?;
-
-            if let Some((doc, embeds)) = documents.first() {
-                // let id = u64::from_be_bytes(doc.hash[..8].try_into()?);
-                let id = Uuid::new_v8(doc.hash[..16].try_into()?).to_string();
-                let value = serde_json::to_value(doc)?;
+                let id = msg.uuid()?.to_string();
+                let value = serde_json::to_value(msg)?;
                 let payload = Payload::try_from(value)?;
-                let embedding = embeds.first().vec.iter().map(|x| *x as f32).collect_vec();
 
                 let point = PointStruct::new(id, embedding, payload);
                 let request =
-                    UpsertPointsBuilder::new(COLLECTION_NAME.as_str(), vec![point]).build();
-                client.upsert_points(request).await?;
+                    UpsertPointsBuilder::new(self.collection.as_str(), vec![point]).build();
+                self.qdrant.upsert_points(request).await?;
+
+                Ok::<_, anyhow::Error>(())
             }
+            .await;
 
-            // vector_store
-            //     .insert_documents(documents)
-            //     .await
-            //     .map_err(|err| anyhow!("Couldn't insert documents: {err}"))?;
-            Ok::<_, anyhow::Error>(())
+            if let Err(e) = result {
+                warn!("Unable to handle snippet: {e:?}");
+            };
         }
-        .await;
 
-        if let Err(e) = result {
-            warn!("Unable to handle snippet: {e:?}");
-        };
+        Ok(())
     }
-
-    Ok(())
 }

@@ -2,20 +2,25 @@ pub mod parse;
 pub mod traverse;
 pub mod workers;
 
-use std::sync::{Arc, LazyLock};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use anyhow::{Context, Result};
 use clap::Parser;
-use fastembed::{EmbeddingModel, ModelInfo, TextEmbedding};
 use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
 };
-use indicatif::{MultiProgress, ProgressBar};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 pub use traverse::*;
 
-use rig::Embed;
+use indoc::indoc;
+use rig::{Embed, agent::Agent, completion::Prompt, providers::ollama};
+use rig::{client::CompletionClient, providers::ollama::CompletionModel};
+use uuid::Uuid;
+
+use async_trait::async_trait;
 
 #[skip_serializing_none]
 #[derive(Embed, serde::Deserialize, serde::Serialize, Debug, Clone)]
@@ -32,6 +37,12 @@ pub struct CodeSnippet {
     pub hash: Vec<u8>,
 }
 
+impl CodeSnippet {
+    pub fn uuid(&self) -> Result<Uuid> {
+        Ok(Uuid::new_v8(self.hash[..16].try_into()?))
+    }
+}
+
 pub struct Progressor {
     pub multi: MultiProgress,
     pub file_progress: ProgressBar,
@@ -42,6 +53,15 @@ impl Default for Progressor {
         let multi = MultiProgress::new();
         let file_progress = multi.add(ProgressBar::no_length());
 
+        // Something funny going on with the duration calculation:
+        // Fluctuates between seconds and days, even at half way point.
+        // It's based off of steps per second instead of elapsed time and percent complete
+        file_progress.set_style(
+            ProgressStyle::with_template("[{elapsed_precise}] {wide_bar} {pos}/{len} ({percent}%)")
+                .unwrap(),
+        );
+        file_progress.enable_steady_tick(Duration::from_secs(5));
+
         Self {
             multi,
             file_progress,
@@ -50,6 +70,10 @@ impl Default for Progressor {
 }
 
 pub enum SnippetProgress {
+    StartOfFile {
+        progressor: Arc<Option<Progressor>>,
+        progress: Option<ProgressBar>,
+    },
     Snippet {
         progress: Option<ProgressBar>,
         snippet: CodeSnippet,
@@ -60,22 +84,31 @@ pub enum SnippetProgress {
     },
 }
 
-// TODO: Split into worker specific configs
 // TODO: project description
 #[skip_serializing_none] // This is the solution!
 #[derive(Clone, Parser, Debug, Serialize, Deserialize)]
 // #[command(version, about, long_about = None)]
 pub struct Config {
+    /// Just crawl the repository but don't summarize or insert vectors
     #[arg(long, action=clap::ArgAction::SetTrue)]
     pub dry_run: Option<bool>,
 
+    /// Display progress bars
     #[arg(long, action=clap::ArgAction::SetTrue)]
     pub progress: Option<bool>,
 
+    /// Print the effective configuration and exit
     #[arg(long, action=clap::ArgAction::SetTrue)]
     pub dump_config: Option<bool>,
 
-    // #[arg(long, default_value = "http://10.10.10.100:11434")] // No, masks config file
+    /// Re-summarize and embed known snippets
+    #[arg(long, action=clap::ArgAction::SetTrue)]
+    pub reprocess: Option<bool>,
+
+    /// Number of concurrent summarization tasks. Set to the number of LLM instances available.
+    #[arg(long)]
+    pub summary_workers: Option<u32>,
+
     /// Base URL of the language model server
     #[arg(long)]
     pub llm_base_url: Option<String>,
@@ -84,33 +117,28 @@ pub struct Config {
     #[arg(long)]
     pub llm_model: Option<String>,
 
+    /// Path to local cache for storing embedding models
     #[arg(long)]
-    pub fastembed_cache: Option<String>,
+    pub fastembed_cache: Option<PathBuf>,
 
-    #[arg(long)]
-    pub collection: Option<String>,
-
+    /// The embedding model identifier (e.g. Xenova/all-MiniLM-L6-v2) or enum code (e.g. AllMiniLML6V2Q)
     #[arg(long)]
     pub embed_model: Option<String>,
 
-    pub target_path: Option<String>,
-}
-
-#[skip_serializing_none] // This is the solution!
-#[derive(Clone, Parser, Debug, Serialize, Deserialize)]
-pub struct CommonConfig {}
-
-#[skip_serializing_none] // This is the solution!
-#[derive(Clone, Parser, Debug, Serialize, Deserialize)]
-pub struct SummarizerConfig {
-    // #[arg(long, default_value = "http://10.10.10.100:11434")] // No, masks config file
-    /// Base URL of the language model server
+    /// URL to the qdrant server instance
     #[arg(long)]
-    pub llm_base_url: Option<String>,
+    pub qdrant_url: Option<String>,
 
-    /// Name of the language model for summarizing code snippets
+    /// Name of collection in qdrant
     #[arg(long)]
-    pub llm_model: Option<String>,
+    pub collection: Option<String>,
+
+    /// Path to the language specification YAML file
+    #[arg(long)]
+    pub lang_spec: Option<PathBuf>,
+
+    /// Path of the repository to index
+    pub target_path: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -119,61 +147,160 @@ impl Default for Config {
             dry_run: Default::default(),
             progress: Default::default(),
             dump_config: Default::default(),
+            reprocess: Default::default(),
+            summary_workers: Some(1),
             llm_model: Some("devstral:latest".into()),
             llm_base_url: Some("http://localhost:11434".into()),
             collection: Some("myproject".into()),
+            qdrant_url: Some("http://localhost:6334".into()),
             embed_model: Default::default(),
-            fastembed_cache: dirs::cache_dir().and_then(|mut d| {
-                d.push("fastembed");
-                d.into_os_string().into_string().ok()
-            }),
+            fastembed_cache: dirs::cache_dir().map(|d| d.join("fastembed")),
+            lang_spec: Default::default(),
             target_path: Some("./".into()),
         }
     }
 }
 
-// TODO: move these statics back to the bin and pass down to the workers by argument
-pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
-    Figment::new()
-        .merge(Serialized::defaults(Config::default()))
-        .merge(Toml::file(
-            dirs::config_dir()
-                .map(|p| p.join("emberlain"))
-                .unwrap_or_default()
-                .join("config.toml"),
-        ))
-        .merge(Env::prefixed("EMB_"))
-        .merge(Serialized::defaults(Config::parse()))
-        // TODO: select profile from env
-        .extract()
-        .unwrap()
-});
+impl Config {
+    pub fn load() -> Result<Self> {
+        Ok(Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::file(
+                dirs::config_dir()
+                    .map(|p| p.join("emberlain"))
+                    .unwrap_or_default()
+                    .join("config.toml"),
+            ))
+            .merge(Env::prefixed("EMB_"))
+            .merge(Serialized::defaults(Config::parse()))
+            .select(std::env::var("EMB_PROFILE").unwrap_or_default())
+            .extract()?)
+    }
+}
 
-pub static LLM_MODEL: LazyLock<String> = LazyLock::new(|| CONFIG.llm_model.clone().unwrap());
-pub static LLM_BASE_URL: LazyLock<String> = LazyLock::new(|| CONFIG.llm_base_url.clone().unwrap());
-pub static EMBED_INFO: LazyLock<ModelInfo<EmbeddingModel>> = LazyLock::new(|| {
-    let model_name = CONFIG.embed_model.as_ref().unwrap().to_lowercase();
-    let all_embeddings = TextEmbedding::list_supported_models();
-    all_embeddings
-        .iter()
-        .find(|model| {
-            model.model_code.to_lowercase().ends_with(&model_name)
-                || format!("{:?}", model.model)
-                    .to_lowercase()
-                    .ends_with(&model_name)
-        })
-        .cloned()
-        .unwrap_or_else(|| {
-            panic!(
-                "The embedding model '{}' is not valid",
-                CONFIG.embed_model.as_ref().unwrap()
-            )
-        })
-});
+pub fn get_ollama_agent(config: &Config) -> Agent<CompletionModel> {
+    ollama::Client::from_url(config.llm_base_url.as_ref().unwrap())
+        .agent(config.llm_model.as_ref().unwrap())
+        .max_tokens(1024)
+        // TODO: Really need to work on taming the LLM's verbiage
+        .preamble(indoc! {r##"
+            You are a helpful software engineer mentoring a new team-mate.
+            Without preamble or introduction, summarize provided code snippets, in a few sentences.
+            Explain what it does and how it works in general terms without referring to specific values.
+            If it uses higher level concepts and design patterns like observers, pipelines, etc. make note of that.
+            Be sure to mention key types and functions used, if applicable.
+            But do not dwell on basic concepts or things that are obvious like what it means for something to be public.
+            Keep your explanation in paragraph format, using complete sentences.
+        ""##})
+        .build()
+}
 
-pub static EMBED_MODEL: LazyLock<EmbeddingModel> = LazyLock::new(|| EMBED_INFO.model.clone());
-pub static EMBED_DIMS: LazyLock<usize> = LazyLock::new(|| EMBED_INFO.dim);
-pub static COLLECTION_NAME: LazyLock<String> = LazyLock::new(|| CONFIG.collection.clone().unwrap());
+// Allows both static dispatch via generics or dynamic via boxing
+#[async_trait]
+pub trait DynAgent: Send + Sync {
+    async fn prompt(&self, body: &str) -> Result<String>;
+    // TODO: add a `check` method
+}
+
+#[async_trait(?Send)]
+pub trait DynChecker: Send + Sync {
+    async fn call(&self) -> Result<()>;
+}
+
+#[async_trait(?Send)]
+impl<T: AsyncFn() -> Result<()> + Send + Sync> DynChecker for T {
+    async fn call(&self) -> Result<()> {
+        (self)().await
+    }
+}
+
+#[async_trait]
+impl<M: rig::completion::CompletionModel> DynAgent for Agent<M> {
+    async fn prompt(&self, body: &str) -> Result<String> {
+        Ok(Prompt::prompt(self, body).await?)
+    }
+}
+
+// The part that supports dynamic dispatch via unsized trait objects.
+#[async_trait]
+impl<T: DynAgent + ?Sized> DynAgent for Box<T> {
+    async fn prompt(&self, body: &str) -> Result<String> {
+        (**self).prompt(body).await
+    }
+}
+
+// // Probably unnecessary given the flexibility of boxed closure style
+//
+// #[async_trait(?Send)]
+// pub trait AgentFactory {
+//     fn build(&self) -> Box<dyn DynAgent>;
+//
+//     async fn check(&self) -> Result<()>;
+// }
+//
+// #[async_trait(?Send)]
+// impl AgentFactory for Box<dyn AgentFactory> {
+//     fn build(&self) -> Box<dyn DynAgent> {
+//         (**self).build()
+//     }
+//
+//     async fn check(&self) -> Result<()> {
+//         (**self).check().await
+//     }
+// }
+//
+// #[async_trait(?Send)]
+// impl AgentFactory for BoxAgentFactory {
+//     fn build(&self) -> Box<dyn DynAgent> {
+//         (self.builder)()
+//     }
+//
+//     async fn check(&self) -> Result<()> {
+//         self.checker.call().await
+//     }
+// }
+
+pub struct AgentFactory {
+    /// Creates an agent instance based on config info supplied during factory initialization.
+    builder: Box<dyn Fn() -> Box<dyn DynAgent>>,
+
+    /// Checks that the provider information supplied when creating the factory is valid.
+    /// i.e. may check API urls, tokens, model names, etc using remote calls.
+    checker: Box<dyn DynChecker>,
+}
+
+impl AgentFactory {
+    pub fn new(builder: Box<dyn Fn() -> Box<dyn DynAgent>>, checker: Box<dyn DynChecker>) -> Self {
+        Self { builder, checker }
+    }
+
+    pub fn build(&self) -> Box<dyn DynAgent> {
+        (self.builder)()
+    }
+
+    pub async fn check(&self) -> Result<()> {
+        self.checker.call().await
+    }
+}
+
+pub fn get_agent_factory(config: &Config) -> Result<AgentFactory> {
+    let checker = {
+        let base_url = config.llm_base_url.clone().unwrap();
+        async move || {
+            reqwest::get(&base_url)
+                .await
+                .context("Unable to connect to LLM provider")?
+                .text()
+                .await?;
+            Ok(())
+        }
+    };
+
+    let config = config.clone();
+    let builder = move || Box::new(get_ollama_agent(&config)) as Box<dyn DynAgent>;
+
+    Ok(AgentFactory::new(Box::new(builder), Box::new(checker)))
+}
 
 #[cfg(test)]
 #[path = "../tests/utils/mod.rs"]

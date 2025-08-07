@@ -42,6 +42,22 @@ pub struct SourceWalker {
     pub snippers: BTreeMap<String, CodeSnipper>,
 }
 
+impl TryFrom<&str> for SourceWalker {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        let mut src_walk = SourceWalker::default();
+        src_walk.load_languages(value)?;
+        Ok(src_walk)
+    }
+}
+
+// impl From<&str> for SourceWalker {
+//     fn from(value: &str) -> Self {
+//         Self::try_from(value).unwrap()
+//     }
+// }
+
 impl SourceWalker {
     pub fn new(engine: Engine) -> Self {
         Self {

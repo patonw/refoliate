@@ -1,46 +1,48 @@
 use anyhow::Context;
+use flume::Sender;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::warn;
 use log::{debug, info};
 use std::{path::Path, sync::Arc};
-use tokio::sync::mpsc::Sender;
+use typed_builder::TypedBuilder;
 
 use crate::{
     CodeSnippet, Progressor, SnippetProgress, SourceWalker,
     parse::{cb::FileMatchArgs, process_node},
 };
 
-// TODO: Extract to lib to reuse in distributed mode
-pub async fn counting_worker(target_path: impl AsRef<Path>) -> anyhow::Result<usize> {
-    let langspec = include_str!("../../etc/languages.yml");
-    let mut src_walk = SourceWalker::default();
-    src_walk.load_languages(langspec)?;
-
-    Ok(src_walk
-        .iter_repo(target_path)?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| !entry.path().is_dir())
-        .count())
+#[derive(TypedBuilder)]
+pub struct ExtractingWorker {
+    walker: SourceWalker,
 }
 
-pub async fn extracting_worker(
-    progressor: Arc<Option<Progressor>>,
-    snippet_tx: Sender<SnippetProgress>,
-    target_path: impl AsRef<Path>,
-) -> anyhow::Result<()> {
-    let langspec = include_str!("../../etc/languages.yml");
-    let mut src_walk = SourceWalker::default();
-    src_walk.load_languages(langspec)?;
-
-    for file_path in src_walk.iter_repo(target_path.as_ref())? {
-        if let Err(err) = extract_file(&progressor, &snippet_tx, &mut src_walk, file_path).await {
-            warn!("{err:?}");
-        }
+impl ExtractingWorker {
+    pub async fn count_files(&mut self, target_path: impl AsRef<Path>) -> anyhow::Result<usize> {
+        Ok(self
+            .walker
+            .iter_repo(target_path)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| !entry.path().is_dir())
+            .count())
     }
 
-    info!("Done walking {:?}", target_path.as_ref());
+    pub async fn run(
+        &mut self,
+        progressor: Arc<Option<Progressor>>,
+        sender: Sender<SnippetProgress>,
+        target_path: impl AsRef<Path>,
+    ) -> anyhow::Result<()> {
+        for file_path in self.walker.iter_repo(target_path.as_ref())? {
+            if let Err(err) = extract_file(&progressor, &sender, &mut self.walker, file_path).await
+            {
+                warn!("{err:?}");
+            }
+        }
 
-    Ok::<_, anyhow::Error>(())
+        info!("Done walking {:?}", target_path.as_ref());
+
+        Ok::<_, anyhow::Error>(())
+    }
 }
 
 async fn extract_file(
@@ -70,6 +72,13 @@ async fn extract_file(
     let snip_tx = snippet_tx.clone();
     let progress = make_file_progress(progressor, &entry);
     let prog = progress.clone();
+
+    snippet_tx
+        .send_async(SnippetProgress::StartOfFile {
+            progressor: progressor.clone(),
+            progress: progress.clone(),
+        })
+        .await?;
 
     process_node(
         entry.tree.root_node(),
@@ -136,18 +145,18 @@ async fn extract_file(
                     snippet,
                 };
 
-                snip_tx.send(msg).await.unwrap();
+                snip_tx.send_async(msg).await.unwrap();
             }
         },
     )
     .await;
+
     snippet_tx
-        .send(SnippetProgress::EndOfFile {
+        .send_async(SnippetProgress::EndOfFile {
             progressor: progressor.clone(),
             progress: progress.clone(),
         })
-        .await
-        .unwrap();
+        .await?;
 
     // Why is this different from the tests?
 
@@ -165,7 +174,7 @@ fn make_file_progress(
 
         byte_progress.set_style(
             ProgressStyle::with_template(
-                "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
+                "[{elapsed_precise}] {bar:30.cyan/blue} {decimal_bytes:>10}/{decimal_total_bytes:10} {wide_msg}",
             )
             .unwrap(),
         );
