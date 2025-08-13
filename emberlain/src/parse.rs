@@ -295,8 +295,6 @@ pub mod tests {
         Ok(())
     }
 
-    // TODO: test extracting names & nodes via breadloaf
-
     #[tokio::test]
     async fn test_recursive_query() -> anyhow::Result<()> {
         let (language, mut parser) = aload_language("rust", TREE_SITTER_RUST).await?;

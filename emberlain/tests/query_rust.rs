@@ -34,7 +34,7 @@ async fn it_struct_def() -> anyhow::Result<()> {
         .parse(source_code, None)
         .ok_or(anyhow!("Could not parse"))?;
 
-    let root = tree.root_node().child(0).expect("File is empty");
+    let root = tree.root_node();
     let counter = Arc::new(AtomicUsize::default());
 
     let loaf = Breadloaf {
@@ -116,7 +116,7 @@ async fn it_impl_struct() -> anyhow::Result<()> {
         .parse(source_code, None)
         .ok_or(anyhow!("Could not parse"))?;
 
-    let root = tree.root_node().child(0).expect("File is empty");
+    let root = tree.root_node();
     let counter = Arc::new(AtomicUsize::default());
 
     let loaf = Breadloaf {
@@ -206,7 +206,7 @@ async fn it_impl_trait() -> anyhow::Result<()> {
         .parse(source_code, None)
         .ok_or(anyhow!("Could not parse"))?;
 
-    let root = tree.root_node().child(0).expect("File is empty");
+    let root = tree.root_node();
     let counter = Arc::new(AtomicUsize::default());
 
     let loaf = Breadloaf {
@@ -269,7 +269,8 @@ async fn it_method_not_func() -> anyhow::Result<()> {
         .parse(source_code, None)
         .ok_or(anyhow!("Could not parse"))?;
 
-    let root = tree.root_node().child(0).expect("File is empty");
+    let root = tree.root_node();
+    dbg!((root.kind(), root.grammar_name(), root.language().name()));
     let counter = Arc::new(AtomicUsize::default());
 
     process_node(root, source_code, &query, vec![], &async |it| {
@@ -278,6 +279,96 @@ async fn it_method_not_func() -> anyhow::Result<()> {
     .await;
 
     assert_that!(counter.load(Ordering::Relaxed), eq(0));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn it_func_attrs() -> anyhow::Result<()> {
+    let (language, mut parser) = aload_language("rust", TREE_SITTER_RUST).await?;
+
+    let query_text = r#"
+            ; It seems the docs are wrong:
+            ; > https://tree-sitter.github.io/tree-sitter/using-parsers/queries/2-operators.html#grouping-sibling-nodes
+            ; The example shows no anchoring '.'
+            ; However, omitting this allows any number of intervening elements between siblings.
+            (
+                (
+                    (attribute_item)
+                    [(line_comment) (block_comment)]*
+                )*
+                .
+                (function_item
+                    name: (identifier) @name.definition.function)
+            ) @definition.function
+        "#;
+    let query = Query::new(&language, query_text)?;
+    dbg!(&query);
+
+    let source_code = r#"
+            // Ignore this
+            #[cfg(feature = "ssr")]
+            /// This does stuff
+            #[tokio::main]
+            // and this maybe
+            fn foobar() {
+                println!("Hello world");
+            }
+
+            // You can't see me
+            fn barbaz() { // I has no attribute
+                println!("Hello world");
+            }
+        "#
+    .as_bytes();
+
+    let tree = parser
+        .parse(source_code, None)
+        .ok_or(anyhow!("Could not parse"))?;
+
+    let root = tree.root_node();
+    // let root = tree.root_node().child(0).expect("File is empty");
+    dbg!((
+        root.kind(),
+        root.grammar_name(),
+        root.language().name(),
+        root.to_sexp()
+    ));
+    let counter = Arc::new(AtomicUsize::default());
+
+    let loaf = Breadloaf {
+        source_code,
+        query: &query,
+    };
+
+    process_node(root, source_code, &query, vec![], &async |it| {
+        counter.fetch_add(1, Ordering::Relaxed);
+
+        assert_that!(
+            loaf.match_kind(it.query_match.as_ref()),
+            some(eq("function"))
+        );
+
+        let cap = &it.query_match.captures[0];
+
+        if loaf.capture_text(it.query_match.as_ref(), "name.definition.function") == Some("foobar")
+        {
+            assert_that!(
+                cap.node.utf8_text(source_code).unwrap(),
+                starts_with("#[cfg("),
+                "foobar should start with a cfg attribute"
+            );
+        } else {
+            assert_that!(
+                cap.node.utf8_text(source_code).unwrap(),
+                starts_with("fn"),
+                "barbaz should start with fn keyword"
+            );
+        }
+    })
+    .await;
+
+    assert_that!(counter.load(Ordering::Relaxed), eq(2));
 
     Ok(())
 }

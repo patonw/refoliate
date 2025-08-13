@@ -1,3 +1,4 @@
+use chrono::Utc;
 use flume::Receiver;
 use flume::Sender;
 use itertools::Itertools;
@@ -41,6 +42,7 @@ impl DedupWorker {
                         .qdrant
                         .scroll(
                             ScrollPointsBuilder::new(&self.collection).filter(Filter::must([
+                                Condition::is_empty("__removed"),
                                 Condition::matches("path", file_path.display().to_string()),
                             ])),
                         )
@@ -57,7 +59,7 @@ impl DedupWorker {
                                 SetPayloadPointsBuilder::new(
                                     &self.collection,
                                     Payload::try_from(json!({
-                                        "__inactive": true,
+                                        "__removed": Utc::now().to_rfc3339(),
                                     }))
                                     .unwrap(),
                                 )
@@ -100,7 +102,7 @@ impl DedupWorker {
                             .delete_payload(
                                 DeletePayloadPointsBuilder::new(
                                     &self.collection,
-                                    vec!["__inactive".to_string()],
+                                    vec!["__removed".to_string()],
                                 )
                                 .points_selector(PointsIdsList { ids: point_ids })
                                 .wait(true),

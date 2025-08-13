@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use emberlain::workers::prune::PruningWorker;
 use fastembed::{EmbeddingModel, ModelInfo, TextEmbedding};
 use indicatif_log_bridge::LogWrapper;
 use log::debug;
@@ -71,6 +72,7 @@ async fn main() -> Result<()> {
             .filter(|t| *t)
             .map(|_| Progressor::default()),
     );
+
     if let Some(bars) = progressor.as_ref() {
         let logger =
             env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -85,6 +87,25 @@ async fn main() -> Result<()> {
     } else {
         LogTracer::init()?;
     }
+
+    let target_path = CONFIG.target_path.clone().unwrap();
+    let target_path = dbg!(std::fs::canonicalize(&target_path)).unwrap_or(target_path);
+
+    let repo_root = CONFIG.repo_root.clone().unwrap_or_else(|| {
+        let repo = git2::Repository::open_ext(
+            &target_path,
+            git2::RepositoryOpenFlags::empty(),
+            &[] as &[&std::ffi::OsStr],
+        )
+        .ok();
+
+        repo.as_ref()
+            .and_then(|r| r.workdir())
+            .map(|p| p.to_path_buf())
+            .unwrap_or(target_path.clone())
+    });
+
+    log::info!("Target dir: {target_path:?} repo root: {repo_root:?}");
 
     // Configure and build all workers
     let src_walker: SourceWalker = if let Some(path) = &CONFIG.lang_spec {
@@ -133,6 +154,14 @@ async fn main() -> Result<()> {
         .collection(CONFIG.collection.clone().unwrap())
         .build();
 
+    let pruner = CONFIG.pruning_cutoff()?.map(|dt| {
+        PruningWorker::builder()
+            .cutoff(dt)
+            .qdrant(qdrant_client.clone())
+            .collection(CONFIG.collection.clone().unwrap())
+            .build()
+    });
+
     // Preliminary book keeping
     let total_count = if CONFIG.progress.filter(|t| *t).is_some() {
         extractor
@@ -162,7 +191,7 @@ async fn main() -> Result<()> {
         let progressor = progressor.clone();
         local.spawn_local(async move {
             if let Err(err) = extractor
-                .run(progressor, snippet_tx, CONFIG.target_path.as_ref().unwrap())
+                .run(progressor, snippet_tx, repo_root, target_path)
                 .await
             {
                 log::error!("{err:?}");
@@ -218,6 +247,10 @@ async fn main() -> Result<()> {
     if let Some(embed_task) = embed_task {
         let embed_errs = embed_task.await.err();
         debug!("Embed workers done: {embed_errs:?}");
+    }
+
+    if let Some(pruner) = pruner {
+        pruner.run().await?;
     }
 
     if let Some(bar) = progressor.as_ref() {

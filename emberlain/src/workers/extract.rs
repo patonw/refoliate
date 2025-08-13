@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use flume::Sender;
 use ignore::{DirEntry, Walk};
 use indicatif::{ProgressBar, ProgressStyle};
+use itertools::Itertools;
+use itertools::MinMaxResult;
 use log::info;
 use log::warn;
 use std::{path::Path, sync::Arc};
@@ -33,6 +35,7 @@ impl ExtractingWorker {
         &mut self,
         progressor: Arc<Option<Progressor>>,
         sender: Sender<SnippetProgress>,
+        repo_root: impl AsRef<Path>,
         target_path: impl AsRef<Path>,
     ) -> Result<()> {
         let walk = filter_repo(self.walker.iter_repo(target_path.as_ref())?);
@@ -41,7 +44,7 @@ impl ExtractingWorker {
                 &progressor,
                 &sender,
                 &mut self.walker,
-                target_path.as_ref(),
+                repo_root.as_ref(),
                 file_path,
             )
             .await
@@ -67,6 +70,8 @@ async fn extract_file(
         .parse_file(file_path.path())
         .await
         .context("Failed to parse file")?;
+
+    // dbg!(tree.root_node().to_sexp());
 
     let file_path = file_path.path();
     let file_path = file_path.strip_prefix(root_path).unwrap_or(file_path);
@@ -101,11 +106,15 @@ async fn extract_file(
             let p = entry.file_path;
             let q = entry.query;
             let src = entry.source;
-            info!("^_- Match {n:?} at {p:?}");
+
+            log::debug!("^_- Match {n:?} at {p:?}");
+            let mut attrs: Vec<String> = Vec::new();
+            let mut interface: Option<String> = None;
             let mut class: Option<String> = None;
             let mut ident: Option<String> = None;
             let mut kind: Option<String> = None;
             let mut body: Option<String> = None;
+            let mut bounds = Vec::new();
 
             // Maybe match destructuring should be part of SourceWalker
             for cap in &n.captures {
@@ -114,21 +123,32 @@ async fn extract_file(
                     continue;
                 }
 
+                // dbg!(cap.node.to_sexp());
                 let cap_name = q.capture_names()[index];
                 let parts: Vec<&str> = cap_name.split(".").collect();
                 match parts.as_slice() {
+                    // What's more common "attribute", "annotation", "decorator"?
+                    ["attribute"] | ["annotation"] => {
+                        if let Ok(n) = cap.node.utf8_text(src) {
+                            attrs.push(n.to_string());
+                        }
+                    }
                     ["definition", k] => {
                         kind = Some(k.to_string());
-                        if let Ok(n) = cap.node.utf8_text(src) {
-                            body = Some(n.to_string());
-                        }
+                        bounds.push(cap.node.start_byte());
+                        bounds.push(cap.node.end_byte());
                     }
                     ["name", "definition", _] => {
                         if let Ok(n) = cap.node.utf8_text(src) {
                             ident = Some(n.to_string());
                         }
                     }
-                    ["name", "reference", _] => {
+                    ["name", "reference", "interface"] => {
+                        if let Ok(n) = cap.node.utf8_text(src) {
+                            interface = Some(n.to_string());
+                        }
+                    }
+                    ["name", "reference", "class"] => {
                         if let Ok(n) = cap.node.utf8_text(src) {
                             class = Some(n.to_string());
                         }
@@ -139,12 +159,19 @@ async fn extract_file(
                 }
             }
 
-            info!("o.O Match results kind: {kind:?} identier: {ident:?}");
+            if let MinMaxResult::MinMax(a, b) = bounds.into_iter().minmax()
+                && let Ok(txt) = str::from_utf8(&src[a..b])
+            {
+                body = Some(txt.to_string());
+            }
+
+            log::debug!("o.O Match results kind: {kind:?} identier: {ident:?} attrs: {attrs:?}");
             if let Some(body) = &body {
                 let snippet = CodeSnippet {
-                    // __active: false,
-                    path: p.display().to_string(), // TODO: relative to repo root
+                    path: p.display().to_string(),
+                    interface,
                     class,
+                    attributes: attrs,
                     name: ident.clone().unwrap_or("???".to_string()),
                     body: body.clone(),
                     summary: "".to_string(),

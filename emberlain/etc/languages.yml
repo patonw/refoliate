@@ -5,6 +5,9 @@
 # you should create a class/impl/etc. pattern that includes methods in its definition list. However,
 # to match functions inside a namespace, you would create a namespace pattern with the recurse directive,
 # but no explicit function patterns inside.
+#
+# Tip: use InspectTree from an nvim instance to visualize the parse structure of a source file. Otherwise,
+# write a script to use tree-sitter to dump out the s-expression for a file, non-interactively.
 javascript:
   extensions:
     - js
@@ -68,9 +71,18 @@ rust:
       (type_item
           name: (type_identifier) @name.definition.class) @definition.class
 
+    # Capturing attributes on functions, since there may be variants for different cfg features
     functions: |
-      (function_item
-          name: (identifier) @name.definition.function) @definition.function
+      (
+          (
+            (attribute_item (attribute) @attribute)
+            .
+            [(line_comment) (block_comment)]*
+          )*
+          .
+          (function_item
+              name: (identifier) @name.definition.function)
+      ) @definition.function
 
     methods: |
       (impl_item

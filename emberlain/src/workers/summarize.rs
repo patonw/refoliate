@@ -22,8 +22,6 @@ impl<A: DynAgent> SummaryWorker<A> {
         receiver: Receiver<SnippetProgress>,
         sender: Sender<CodeSnippet>,
     ) -> anyhow::Result<()> {
-        // TODO: check and skip existing snippets
-        // Not worth batching when using ollama with such weak hardware, but later...
         while let Ok(msg) = receiver.recv_async().await {
             match msg {
                 SnippetProgress::StartOfFile {

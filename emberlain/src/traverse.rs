@@ -196,19 +196,17 @@ impl SourceWalker {
     }
 
     pub async fn parse_file(&mut self, path: impl AsRef<Path>) -> Result<ParsedFile> {
-        if let Ok(snipper) = self.snipper_for_path(path.as_ref()).await {
-            let mut source_code: Vec<u8> = Vec::new();
-            let mut fh = File::open(path.as_ref()).await?;
-            fh.read_to_end(&mut source_code).await?;
-            let parser = &mut snipper.parser;
+        let snipper = self.snipper_for_path(path.as_ref()).await?;
+        let mut source_code: Vec<u8> = Vec::new();
+        let mut fh = File::open(path.as_ref()).await?;
+        fh.read_to_end(&mut source_code).await?;
+        let parser = &mut snipper.parser;
 
-            let tree = parser
-                .parse(&source_code, None)
-                .ok_or(anyhow!("Could not parse"))?;
+        let tree = parser
+            .parse(&source_code, None)
+            .ok_or(anyhow!("Could not parse"))?;
 
-            return Ok((source_code, tree, snipper.query.clone()));
-        }
-        Err(anyhow!("Nope"))
+        Ok((source_code, tree, snipper.query.clone()))
     }
 }
 

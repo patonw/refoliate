@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use cached::proc_macro::cached;
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
 };
+use humantime::parse_duration;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indoc::indoc;
 use qdrant_client::{
@@ -29,8 +31,18 @@ pub mod workers;
 pub use traverse::*;
 
 #[cached]
-fn make_id_hash(path: String, class: Option<String>, name: String) -> Vec<u8> {
-    let data = format!("{path}\n{}\n{name}", class.as_deref().unwrap_or_default());
+fn make_id_hash(
+    path: String,
+    interface: Option<String>,
+    class: Option<String>,
+    attributes: Vec<String>,
+    name: String,
+) -> Vec<u8> {
+    let data = format!(
+        "{path}\n{}\n{}\n{attributes:?}\n{name}",
+        interface.as_deref().unwrap_or_default(),
+        class.as_deref().unwrap_or_default()
+    );
 
     blake3::hash(data.as_bytes()).as_bytes().to_vec()
 }
@@ -39,12 +51,25 @@ fn make_id_hash(path: String, class: Option<String>, name: String) -> Vec<u8> {
 #[skip_serializing_none]
 #[derive(Embed, serde::Deserialize, serde::Serialize, Debug, Clone)]
 pub struct CodeSnippet {
-    // pub __active: bool,
+    /// If the file is in a repository, this is relative to the repo root.
+    /// Otherwise, relative to the target path argument.
     pub path: String,
+
+    /// Name of the interface/trait/etc if this is a member function
+    pub interface: Option<String>,
+
+    /// Name of the class/struct/etc if this is a member function
     pub class: Option<String>,
+
+    pub attributes: Vec<String>,
+
+    /// The name of this function/method/type/etc
     pub name: String,
+
+    /// The contents of the snippet
     pub body: String,
 
+    /// An LLM generated summary
     #[embed]
     pub summary: String,
 
@@ -56,22 +81,36 @@ pub struct CodeSnippet {
 impl CodeSnippet {
     pub fn uuid(&self) -> Result<Uuid> {
         let CodeSnippet {
-            path, class, name, ..
+            path,
+            interface,
+            class,
+            attributes,
+            name,
+            ..
         } = self;
 
-        let hash = make_id_hash(path.clone(), class.clone(), name.clone());
+        let hash = make_id_hash(
+            path.clone(),
+            interface.clone(),
+            class.clone(),
+            attributes.clone(),
+            name.clone(),
+        );
 
         Ok(Uuid::new_v8(hash[..16].try_into()?))
     }
 
     pub fn body(&self) -> Cow<String> {
-        // TODO: strip out comments since we want to rely on LLM to interpret code rather than
-        // regurgitating out-of-date or deceptive descriptions
         // TODO: universal commenting or wrap in markdown
-        if let Some(self_type) = &self.class {
-            Cow::Owned(format!("/// self: {self_type}\n{}", &self.body))
-        } else {
-            Cow::Borrowed(&self.body)
+        match (&self.interface, &self.class) {
+            (Some(trait_type), Some(class_type)) => Cow::Owned(format!(
+                "/// self: {trait_type} for {class_type}\n{}",
+                &self.body
+            )),
+            (None, Some(class_type)) => {
+                Cow::Owned(format!("/// self: {class_type}\n{}", &self.body))
+            }
+            _ => Cow::Borrowed(&self.body),
         }
     }
 }
@@ -139,6 +178,16 @@ pub struct Config {
     #[arg(long, action=clap::ArgAction::SetTrue)]
     pub reprocess: Option<bool>,
 
+    /// Remove stale entries after walking the repo
+    ///
+    /// Can be "all" or a duration like "30days", "1month", etc.
+    /// using https://docs.rs/humantime/latest/humantime/fn.parse_duration.html.
+    ///
+    /// The cutoff is based on when an entry was first absent during a crawl,
+    /// rather than when it was added or actually removed from the repositoy.
+    #[arg(long)]
+    pub prune: Option<String>,
+
     /// Number of concurrent summarization tasks. Set to the number of LLM instances available.
     #[arg(long)]
     pub summary_workers: Option<u32>,
@@ -177,6 +226,12 @@ pub struct Config {
     #[arg(long)]
     pub lang_spec: Option<PathBuf>,
 
+    /// Override the base directory used to calculate relative paths within the target path.
+    ///
+    /// Otherwise, this is discovered automatically by traversing the file system.
+    #[arg(long)]
+    pub repo_root: Option<PathBuf>,
+
     /// Path of the repository to index
     pub target_path: Option<PathBuf>,
 }
@@ -188,6 +243,7 @@ impl Default for Config {
             progress: Default::default(),
             dump_config: Default::default(),
             reprocess: Default::default(),
+            prune: Default::default(),
             summary_workers: Some(1),
             persona: None,
             llm_model: Some("devstral:latest".into()),
@@ -197,6 +253,7 @@ impl Default for Config {
             embed_model: Default::default(),
             fastembed_cache: dirs::cache_dir().map(|d| d.join("fastembed")),
             lang_spec: Default::default(),
+            repo_root: None,
             target_path: Some("./".into()),
         }
     }
@@ -216,6 +273,20 @@ impl Config {
             .merge(Serialized::defaults(Config::parse()))
             .select(std::env::var("EMB_PROFILE").unwrap_or_default())
             .extract()?)
+    }
+
+    pub fn pruning_cutoff(&self) -> Result<Option<DateTime<Utc>>> {
+        if let Some(dur) = self.prune.as_ref() {
+            if dur == "all" || dur == "now" {
+                Ok(Some(DateTime::<Utc>::MAX_UTC))
+            } else {
+                let delta = parse_duration(dur).context("Invalid duration. See https://docs.rs/humantime/latest/humantime/fn.parse_duration.html")?;
+                let delta = chrono::Duration::from_std(delta)?;
+                Ok(Utc::now().checked_sub_signed(delta))
+            }
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -241,7 +312,6 @@ pub fn get_ollama_agent(config: &Config) -> Agent<CompletionModel> {
 #[async_trait]
 pub trait DynAgent: Send + Sync {
     async fn prompt(&self, body: &str) -> Result<String>;
-    // TODO: add a `check` method
 }
 
 #[async_trait(?Send)]
@@ -354,15 +424,24 @@ pub async fn init_collection(client: &Qdrant, collection: &str, dims: u64) -> Re
             .await?;
     }
 
-    for field in ["path", "name", "hash"] {
+    for field in ["path", "name", "hash", "attributes"] {
         // Hoping this works on an empty collection and doesn't blow up if an index already exists
         client
-            .create_field_index(
-                CreateFieldIndexCollectionBuilder::new(collection, field, FieldType::Keyword)
-                    .wait(true),
-            )
+            .create_field_index(CreateFieldIndexCollectionBuilder::new(
+                collection,
+                field,
+                FieldType::Keyword,
+            ))
             .await?;
     }
+
+    client
+        .create_field_index(CreateFieldIndexCollectionBuilder::new(
+            collection,
+            "__removed",
+            FieldType::Datetime,
+        ))
+        .await?;
 
     Ok(())
 }
