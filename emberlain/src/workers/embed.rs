@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use fastembed::TextEmbedding;
 use flume::Receiver;
 use log::{info, warn};
@@ -7,6 +5,7 @@ use qdrant_client::{
     Payload, Qdrant,
     qdrant::{PointStruct, UpsertPointsBuilder},
 };
+use std::sync::Arc;
 use typed_builder::TypedBuilder;
 
 use crate::CodeSnippet;

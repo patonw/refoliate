@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.98"
 async-trait = "0.1.88"
 blake3 = "1.8.2"
+cached = "0.56.0"
 cached-path = "0.8.1"
 clap = { version = "4.5.40", features = ["env", "derive"] }
 dirs = "6.0.0"
@@ -15,6 +16,7 @@ env_logger = "0.11.8"
 fastembed = "4.9.1"
 figment = { version = "0.10.19", features = ["env", "toml"] }
 flume = { version = "0.11.1", features = ["async"] }
+hex = "0.4.3"
 ignore = "0.4.23"
 indicatif = "0.18.0"
 indicatif-log-bridge = "0.2.3"
@@ -28,7 +30,7 @@ rig-fastembed = "0.2.1"
 rig-qdrant = "0.1.15"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
-serde_with = "3.14.0"
+serde_with = { version = "3.14.0", features = ["hex"] }
 serde_yml = "0.0.12"
 textwrap = "0.16.2"
 thiserror = "2.0.12"

@@ -27,6 +27,7 @@ impl<A: DynAgent> SummaryWorker<A> {
         while let Ok(msg) = receiver.recv_async().await {
             match msg {
                 SnippetProgress::StartOfFile {
+                    file_path: _,
                     progressor: _,
                     progress,
                 } => {
@@ -46,16 +47,7 @@ impl<A: DynAgent> SummaryWorker<A> {
 
                     let count = snippet.body.len();
 
-                    // TODO: strip out comments since we want to rely on LLM to interpret code rather than
-                    // regurgitating out-of-date or deceptive descriptions
-                    let body = if let Some(self_type) = &snippet.class {
-                        // TODO: universal commenting or wrap in markdown
-                        format!("/// self: {self_type}\n{}", &snippet.body)
-                    } else {
-                        snippet.body.clone()
-                    };
-
-                    let hash = blake3::hash(body.as_bytes()).as_bytes().to_vec();
+                    let body = snippet.body();
 
                     let options = textwrap::Options::new(100)
                         .initial_indent(">>> ")
@@ -67,7 +59,6 @@ impl<A: DynAgent> SummaryWorker<A> {
                             Ok(resp) => {
                                 let snippet = CodeSnippet {
                                     summary: resp,
-                                    hash,
                                     ..snippet
                                 };
                                 sender.send_async(snippet).await.unwrap();

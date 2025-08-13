@@ -10,10 +10,9 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
+use tokio::task;
 use tree_sitter::Tree;
 use tree_sitter::{Language, Parser, Query, WasmStore, wasmtime::Engine};
-
-use tokio::task;
 
 use crate::parse::cb::FileMatchArgs;
 
@@ -182,7 +181,7 @@ impl SourceWalker {
         Ok(())
     }
 
-    pub fn iter_repo(&mut self, root: impl AsRef<Path>) -> Result<Walk> {
+    pub fn iter_repo(&self, root: impl AsRef<Path>) -> Result<Walk> {
         let mut types_builder = TypesBuilder::new();
         for (lang, spec) in &self.languages {
             for ext in &spec.extensions {

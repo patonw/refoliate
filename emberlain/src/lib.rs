@@ -1,30 +1,45 @@
-pub mod parse;
-pub mod traverse;
-pub mod workers;
-
-use std::{path::PathBuf, sync::Arc, time::Duration};
-
 use anyhow::{Context, Result};
+use async_trait::async_trait;
+use cached::proc_macro::cached;
 use clap::Parser;
 use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
 };
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use serde::{Deserialize, Serialize};
-use serde_with::skip_serializing_none;
-pub use traverse::*;
-
 use indoc::indoc;
+use qdrant_client::{
+    Qdrant,
+    qdrant::{
+        CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, Distance, FieldType,
+        VectorParamsBuilder,
+    },
+};
 use rig::{Embed, agent::Agent, completion::Prompt, providers::ollama};
 use rig::{client::CompletionClient, providers::ollama::CompletionModel};
+use serde::{Deserialize, Serialize};
+use serde_with::{serde_as, skip_serializing_none};
+use std::{borrow::Cow, path::PathBuf, sync::Arc, time::Duration};
 use uuid::Uuid;
 
-use async_trait::async_trait;
+pub mod parse;
+pub mod traverse;
+pub mod workers;
 
+pub use traverse::*;
+
+#[cached]
+fn make_id_hash(path: String, class: Option<String>, name: String) -> Vec<u8> {
+    let data = format!("{path}\n{}\n{name}", class.as_deref().unwrap_or_default());
+
+    blake3::hash(data.as_bytes()).as_bytes().to_vec()
+}
+
+#[serde_as]
 #[skip_serializing_none]
 #[derive(Embed, serde::Deserialize, serde::Serialize, Debug, Clone)]
 pub struct CodeSnippet {
+    // pub __active: bool,
     pub path: String,
     pub class: Option<String>,
     pub name: String,
@@ -33,13 +48,31 @@ pub struct CodeSnippet {
     #[embed]
     pub summary: String,
 
-    #[serde(skip_serializing)]
+    // #[serde(skip_serializing)]
+    #[serde_as(as = "serde_with::hex::Hex")]
     pub hash: Vec<u8>,
 }
 
 impl CodeSnippet {
     pub fn uuid(&self) -> Result<Uuid> {
-        Ok(Uuid::new_v8(self.hash[..16].try_into()?))
+        let CodeSnippet {
+            path, class, name, ..
+        } = self;
+
+        let hash = make_id_hash(path.clone(), class.clone(), name.clone());
+
+        Ok(Uuid::new_v8(hash[..16].try_into()?))
+    }
+
+    pub fn body(&self) -> Cow<String> {
+        // TODO: strip out comments since we want to rely on LLM to interpret code rather than
+        // regurgitating out-of-date or deceptive descriptions
+        // TODO: universal commenting or wrap in markdown
+        if let Some(self_type) = &self.class {
+            Cow::Owned(format!("/// self: {self_type}\n{}", &self.body))
+        } else {
+            Cow::Borrowed(&self.body)
+        }
     }
 }
 
@@ -71,6 +104,7 @@ impl Default for Progressor {
 
 pub enum SnippetProgress {
     StartOfFile {
+        file_path: PathBuf,
         progressor: Arc<Option<Progressor>>,
         progress: Option<ProgressBar>,
     },
@@ -84,7 +118,7 @@ pub enum SnippetProgress {
     },
 }
 
-// TODO: project description
+/// Crawls a source repository, generating summaries to insert into a semantic search database.
 #[skip_serializing_none] // This is the solution!
 #[derive(Clone, Parser, Debug, Serialize, Deserialize)]
 // #[command(version, about, long_about = None)]
@@ -101,13 +135,19 @@ pub struct Config {
     #[arg(long, action=clap::ArgAction::SetTrue)]
     pub dump_config: Option<bool>,
 
-    /// Re-summarize and embed known snippets
+    /// Re-summarize and embed previously processed snippets
     #[arg(long, action=clap::ArgAction::SetTrue)]
     pub reprocess: Option<bool>,
 
     /// Number of concurrent summarization tasks. Set to the number of LLM instances available.
     #[arg(long)]
     pub summary_workers: Option<u32>,
+
+    /// Instructions given to the summary agent describing its persona.
+    ///
+    /// Using a heredoc or multiline config string is recommended over a program argument.
+    #[arg(long)]
+    pub persona: Option<String>,
 
     /// Base URL of the language model server
     #[arg(long)]
@@ -149,6 +189,7 @@ impl Default for Config {
             dump_config: Default::default(),
             reprocess: Default::default(),
             summary_workers: Some(1),
+            persona: None,
             llm_model: Some("devstral:latest".into()),
             llm_base_url: Some("http://localhost:11434".into()),
             collection: Some("myproject".into()),
@@ -179,11 +220,7 @@ impl Config {
 }
 
 pub fn get_ollama_agent(config: &Config) -> Agent<CompletionModel> {
-    ollama::Client::from_url(config.llm_base_url.as_ref().unwrap())
-        .agent(config.llm_model.as_ref().unwrap())
-        .max_tokens(1024)
-        // TODO: Really need to work on taming the LLM's verbiage
-        .preamble(indoc! {r##"
+    let preamble = config.persona.as_deref().unwrap_or(indoc! {r##"
             You are a helpful software engineer mentoring a new team-mate.
             Without preamble or introduction, summarize provided code snippets, in a few sentences.
             Explain what it does and how it works in general terms without referring to specific values.
@@ -191,7 +228,12 @@ pub fn get_ollama_agent(config: &Config) -> Agent<CompletionModel> {
             Be sure to mention key types and functions used, if applicable.
             But do not dwell on basic concepts or things that are obvious like what it means for something to be public.
             Keep your explanation in paragraph format, using complete sentences.
-        ""##})
+        ""##});
+    ollama::Client::from_url(config.llm_base_url.as_ref().unwrap())
+        .agent(config.llm_model.as_ref().unwrap())
+        .max_tokens(1024)
+        // TODO: Really need to work on taming the LLM's verbiage
+        .preamble(preamble)
         .build()
 }
 
@@ -300,6 +342,29 @@ pub fn get_agent_factory(config: &Config) -> Result<AgentFactory> {
     let builder = move || Box::new(get_ollama_agent(&config)) as Box<dyn DynAgent>;
 
     Ok(AgentFactory::new(Box::new(builder), Box::new(checker)))
+}
+
+pub async fn init_collection(client: &Qdrant, collection: &str, dims: u64) -> Result<()> {
+    if !client.collection_exists(collection).await? {
+        client
+            .create_collection(
+                CreateCollectionBuilder::new(collection)
+                    .vectors_config(VectorParamsBuilder::new(dims, Distance::Cosine)),
+            )
+            .await?;
+    }
+
+    for field in ["path", "name", "hash"] {
+        // Hoping this works on an empty collection and doesn't blow up if an index already exists
+        client
+            .create_field_index(
+                CreateFieldIndexCollectionBuilder::new(collection, field, FieldType::Keyword)
+                    .wait(true),
+            )
+            .await?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

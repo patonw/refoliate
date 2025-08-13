@@ -1,8 +1,9 @@
-use anyhow::Context;
+use anyhow::{Context, Result};
 use flume::Sender;
+use ignore::{DirEntry, Walk};
 use indicatif::{ProgressBar, ProgressStyle};
+use log::info;
 use log::warn;
-use log::{debug, info};
 use std::{path::Path, sync::Arc};
 use typed_builder::TypedBuilder;
 
@@ -16,14 +17,16 @@ pub struct ExtractingWorker {
     walker: SourceWalker,
 }
 
+// Can't inline with iter_repo due to borrowing restrictions
+fn filter_repo(walk: Walk) -> impl Iterator<Item = DirEntry> {
+    walk.filter_map(|entry| entry.ok())
+        .filter(|entry| !entry.path().is_dir())
+}
+
 impl ExtractingWorker {
-    pub async fn count_files(&mut self, target_path: impl AsRef<Path>) -> anyhow::Result<usize> {
-        Ok(self
-            .walker
-            .iter_repo(target_path)?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| !entry.path().is_dir())
-            .count())
+    pub async fn count_files(&mut self, target_path: impl AsRef<Path>) -> Result<usize> {
+        let walk = filter_repo(self.walker.iter_repo(target_path.as_ref())?);
+        Ok(walk.count())
     }
 
     pub async fn run(
@@ -31,9 +34,17 @@ impl ExtractingWorker {
         progressor: Arc<Option<Progressor>>,
         sender: Sender<SnippetProgress>,
         target_path: impl AsRef<Path>,
-    ) -> anyhow::Result<()> {
-        for file_path in self.walker.iter_repo(target_path.as_ref())? {
-            if let Err(err) = extract_file(&progressor, &sender, &mut self.walker, file_path).await
+    ) -> Result<()> {
+        let walk = filter_repo(self.walker.iter_repo(target_path.as_ref())?);
+        for file_path in walk {
+            if let Err(err) = extract_file(
+                &progressor,
+                &sender,
+                &mut self.walker,
+                target_path.as_ref(),
+                file_path,
+            )
+            .await
             {
                 warn!("{err:?}");
             }
@@ -49,21 +60,19 @@ async fn extract_file(
     progressor: &Arc<Option<Progressor>>,
     snippet_tx: &Sender<SnippetProgress>,
     src_walk: &mut SourceWalker,
-    file_path: std::result::Result<ignore::DirEntry, ignore::Error>,
-) -> anyhow::Result<()> {
-    let file_path = file_path.context("Error while walking repo")?;
-    if file_path.path().is_dir() {
-        debug!("Directory: {file_path:?}");
-        return Ok(());
-    }
-
+    root_path: impl AsRef<Path>,
+    file_path: ignore::DirEntry,
+) -> Result<()> {
     let (source_code, tree, query) = src_walk
         .parse_file(file_path.path())
         .await
         .context("Failed to parse file")?;
 
+    let file_path = file_path.path();
+    let file_path = file_path.strip_prefix(root_path).unwrap_or(file_path);
+
     let entry = FileMatchArgs {
-        file_path: file_path.path(),
+        file_path,
         source: source_code.as_slice(),
         tree: &tree,
         query: query.as_ref(),
@@ -75,6 +84,7 @@ async fn extract_file(
 
     snippet_tx
         .send_async(SnippetProgress::StartOfFile {
+            file_path: file_path.to_path_buf(),
             progressor: progressor.clone(),
             progress: progress.clone(),
         })
@@ -132,7 +142,8 @@ async fn extract_file(
             info!("o.O Match results kind: {kind:?} identier: {ident:?}");
             if let Some(body) = &body {
                 let snippet = CodeSnippet {
-                    path: p.display().to_string(),
+                    // __active: false,
+                    path: p.display().to_string(), // TODO: relative to repo root
                     class,
                     name: ident.clone().unwrap_or("???".to_string()),
                     body: body.clone(),
