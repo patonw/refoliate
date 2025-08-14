@@ -9,11 +9,11 @@ use qdrant_client::qdrant::vectors_output::VectorsOptions;
 use qdrant_client::qdrant::{
     GetPointsBuilder, PointId, QueryPointsBuilder, ScrollPointsBuilder, vectors_config,
 };
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -25,7 +25,8 @@ use tokio::runtime::Runtime;
 
 use eframe::egui;
 use egui::{
-    Align, CollapsingHeader, Color32, Frame, Layout, RichText, ScrollArea, Sense, UiBuilder,
+    Align, CollapsingHeader, Color32, Frame, Layout, RichText, ScrollArea, Sense, Style, UiBuilder,
+    Visuals,
 };
 use egui_plot::{MarkerShape, Plot, PlotResponse, Points};
 
@@ -122,7 +123,7 @@ struct AppState {
     hash_to_uuid: HashMap<egui::Id, String>,
     hover_point: Option<String>,
     select_point: Option<String>,
-    point_details: BTreeMap<String, String>,
+    point_details: BTreeMap<String, Value>,
     semantic: SemanticQuery,
     available_collections: Arc<Vec<String>>,
     collection_name: Option<String>,
@@ -157,7 +158,14 @@ struct MyEguiApp {
 }
 
 impl MyEguiApp {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // TODO: dynamic style. Invert marker colors too.
+        let style = Style {
+            visuals: Visuals::dark(),
+            ..Style::default()
+        };
+        cc.egui_ctx.set_style(style);
+
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
@@ -674,16 +682,53 @@ impl MyEguiApp {
             ui.vertical(|ui| {
                 let app_state = self.app_state.lock().unwrap();
                 for (k, v) in &app_state.point_details {
+                    let collapsed =
+                        matches!(v.as_str().map(|s| s.len()), Some(length) if length > 128);
                     CollapsingHeader::new(k)
-                        .default_open(v.len() < 128)
-                        .show(ui, |ui| {
-                            ui.label(v);
+                        .default_open(!collapsed)
+                        .show(ui, |ui| match v {
+                            Value::String(s) => ui.label(s),
+                            Value::Array(values) => {
+                                egui::Grid::new("attr_grid")
+                                    .num_columns(1)
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        for value in values {
+                                            if let Some(text) = value.as_str() {
+                                                ui.label(text);
+                                            } else {
+                                                ui.label(format!("{value}"));
+                                            }
+                                            ui.end_row();
+                                        }
+                                    })
+                                    .response
+                            }
+                            Value::Object(data) => {
+                                egui::Grid::new("attr_grid")
+                                    .num_columns(2)
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        for (key, value) in data {
+                                            ui.label(key);
+
+                                            if let Some(text) = value.as_str() {
+                                                ui.label(text);
+                                            } else {
+                                                ui.label(format!("{value}"));
+                                            }
+                                            ui.end_row();
+                                        }
+                                    })
+                                    .response
+                            }
+                            _ => ui.label(format!("{v}")),
                         });
                 }
 
                 // Add an extra line to prevent clipping on long text
                 let font_id = egui::TextStyle::Body.resolve(ui.style());
-                ui.add_space(font_id.size / 2.0);
+                ui.add_space(font_id.size);
             });
         });
         // });
@@ -789,18 +834,21 @@ impl MyEguiApp {
                     }
                 }
 
-                let details_id = app_state
+                let selected_id = app_state
                     .select_point
                     .as_ref()
                     .or(app_state.hover_point.as_ref())
                     .cloned();
 
-                if app_state.point_details.get("id") != details_id.as_ref()
-                    && let Some(id) = details_id.as_ref()
+                let old_id = app_state.point_details.get("id").and_then(|id| id.as_str());
+                if let Some(id) = selected_id.as_ref()
+                    && old_id != selected_id.as_deref()
                 {
                     app_state.point_details.clear();
-                    app_state.point_details.insert("id".into(), id.clone());
-                    details_id
+                    app_state
+                        .point_details
+                        .insert("id".into(), json!(id.clone()));
+                    selected_id
                 } else {
                     None
                 }
@@ -841,10 +889,10 @@ impl MyEguiApp {
                         app_state
                             .point_details
                             .extend(point.payload.iter().map(|(k, v)| {
-                                (
-                                    k.clone(),
-                                    v.as_str().cloned().unwrap_or_else(|| v.to_string()),
-                                )
+                                let value = serde_json::to_value(v).unwrap_or_else(
+                                |_| json! { v.as_str().cloned().unwrap_or_else(|| v.to_string()) },
+                            );
+                                (k.clone(), value)
                             }));
                     }
                     task_count.fetch_sub(1, Ordering::Relaxed);
