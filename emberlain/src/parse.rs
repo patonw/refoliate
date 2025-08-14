@@ -8,7 +8,6 @@ pub mod cb {
     use tree_sitter::Query;
     use tree_sitter::Tree;
 
-    #[derive(Debug)]
     pub struct FileMatchArgs<'a> {
         pub file_path: &'a Path,
         pub source: &'a [u8],

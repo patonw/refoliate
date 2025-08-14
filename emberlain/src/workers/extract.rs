@@ -107,12 +107,12 @@ async fn extract_file(
             let q = entry.query;
             let src = entry.source;
 
-            log::debug!("^_- Match {n:?} at {p:?}");
+            // log::debug!("^_- Match {n:?} at {p:?}");
             let mut attrs: Vec<String> = Vec::new();
             let mut interface: Option<String> = None;
             let mut class: Option<String> = None;
             let mut ident: Option<String> = None;
-            let mut kind: Option<String> = None;
+            // let mut kind: Option<String> = None;
             let mut body: Option<String> = None;
             let mut bounds = Vec::new();
 
@@ -133,8 +133,8 @@ async fn extract_file(
                             attrs.push(n.to_string());
                         }
                     }
-                    ["definition", k] => {
-                        kind = Some(k.to_string());
+                    ["definition", _] => {
+                        // kind = Some(k.to_string());
                         bounds.push(cap.node.start_byte());
                         bounds.push(cap.node.end_byte());
                     }
@@ -165,7 +165,9 @@ async fn extract_file(
                 body = Some(txt.to_string());
             }
 
-            log::debug!("o.O Match results kind: {kind:?} identier: {ident:?} attrs: {attrs:?}");
+            let rendered = String::new();
+
+            // log::debug!("o.O Match results kind: {kind:?} identier: {ident:?} attrs: {attrs:?}");
             if let Some(body) = &body {
                 let snippet = CodeSnippet {
                     path: p.display().to_string(),
@@ -176,6 +178,7 @@ async fn extract_file(
                     body: body.clone(),
                     summary: "".to_string(),
                     hash: Default::default(),
+                    rendered,
                 };
 
                 let msg = SnippetProgress::Snippet {

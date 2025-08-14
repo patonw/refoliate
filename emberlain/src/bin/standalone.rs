@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use emberlain::LanguageMap;
+use emberlain::template::Templater;
 use emberlain::workers::prune::PruningWorker;
 use fastembed::{EmbeddingModel, ModelInfo, TextEmbedding};
 use indicatif_log_bridge::LogWrapper;
@@ -89,7 +91,7 @@ async fn main() -> Result<()> {
     }
 
     let target_path = CONFIG.target_path.clone().unwrap();
-    let target_path = dbg!(std::fs::canonicalize(&target_path)).unwrap_or(target_path);
+    let target_path = std::fs::canonicalize(&target_path).unwrap_or(target_path);
 
     let repo_root = CONFIG.repo_root.clone().unwrap_or_else(|| {
         let repo = git2::Repository::open_ext(
@@ -108,11 +110,15 @@ async fn main() -> Result<()> {
     log::info!("Target dir: {target_path:?} repo root: {repo_root:?}");
 
     // Configure and build all workers
-    let src_walker: SourceWalker = if let Some(path) = &CONFIG.lang_spec {
-        std::fs::read_to_string(path)?.as_str().try_into()?
+    let lang_specs: String = if let Some(path) = &CONFIG.lang_spec {
+        std::fs::read_to_string(path)?
     } else {
-        include_str!("../../etc/languages.yml").try_into()?
+        include_str!("../../etc/languages.yml").to_string()
     };
+
+    let src_walker: SourceWalker = lang_specs.as_str().try_into()?;
+    let lang_specs: Arc<LanguageMap> = Arc::new(serde_yml::from_str(&lang_specs)?);
+    let templater = Templater::new(lang_specs.clone())?;
 
     let qdrant_client = Qdrant::from_url(CONFIG.qdrant_url.as_ref().unwrap()).build()?;
     init_collection(&qdrant_client, COLLECTION_NAME.as_str(), *EMBED_DIMS as u64).await?;
@@ -125,6 +131,7 @@ async fn main() -> Result<()> {
         .await?;
 
     let deduper = DedupWorker::builder()
+        .templater(templater)
         .reprocess(CONFIG.reprocess.unwrap_or_default())
         .qdrant(qdrant_client.clone())
         .collection(CONFIG.collection.clone().unwrap())

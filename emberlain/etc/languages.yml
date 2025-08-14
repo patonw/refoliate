@@ -12,47 +12,7 @@ javascript:
   extensions:
     - js
   grammar_path: https://github.com/tree-sitter/tree-sitter-javascript/releases/download/v0.23.1/tree-sitter-javascript.wasm
-  queries:
-    methods: |
-      (
-        (comment)* @doc
-        .
-        (method_definition
-          name: (property_identifier) @name.definition.method) @definition.method
-        (#not-eq? @name.definition.method "constructor")
-        (#strip! @doc "^[\\s\\*/]+|^[\\s\\*/]$")
-        (#select-adjacent! @doc @definition.method)
-      )
-    classes: |
-      (
-        (comment)* @doc
-        .
-        [
-          (class
-            name: (_) @name.definition.class)
-          (class_declaration
-            name: (_) @name.definition.class)
-        ] @definition.class
-        (#strip! @doc "^[\\s\\*/]+|^[\\s\\*/]$")
-        (#select-adjacent! @doc @definition.class)
-      )
-    functions: |
-      (
-        (comment)* @doc
-        .
-        [
-          (function_expression
-            name: (identifier) @name.definition.function)
-          (function_declaration
-            name: (identifier) @name.definition.function)
-          (generator_function
-            name: (identifier) @name.definition.function)
-          (generator_function_declaration
-            name: (identifier) @name.definition.function)
-        ] @definition.function
-        (#strip! @doc "^[\\s\\*/]+|^[\\s\\*/]$")
-        (#select-adjacent! @doc @definition.function)
-      )
+  queries: {}
 rust:
   extensions:
     - rs
@@ -60,10 +20,10 @@ rust:
   queries:
     traits: |
       (trait_item
-          name: (type_identifier) @name.definition.interface) @definition.interface
+          name: [(type_identifier) (generic_type)] @name.definition.interface) @definition.interface
     types: |
       (struct_item
-          name: (type_identifier) @name.definition.class) @definition.class
+          name: [(type_identifier) (generic_type)] @name.definition.class) @definition.class
       (enum_item
           name: (type_identifier) @name.definition.class) @definition.class
       (union_item
@@ -86,8 +46,8 @@ rust:
 
     methods: |
       (impl_item
-          trait: (type_identifier) @name.reference.interface
-          type: (type_identifier) @name.reference.class
+          trait: [(type_identifier) (generic_type)] @name.reference.interface
+          type: [(type_identifier) (generic_type)] @name.reference.class
           body: (declaration_list
               (function_item
                   name: (identifier) @name.definition.method) @definition.method
@@ -109,39 +69,14 @@ rust:
           body: (declaration_list)
           (#set! recurse)) @definition.module
 
-#      #### Seems to overlap with functions. Need to check tree-sitter docs
-#      methods: |
-#        (declaration_list
-#            (function_item
-#                name: (identifier) @name.definition.method) @definition.method)
-#
-#     modules: |
-#       (mod_item
-#           name: (identifier) @name.definition.module) @definition.module
-#
-#     other: |
-#       ; macro definitions
-#
-#       (macro_definition
-#           name: (identifier) @name.definition.macro) @definition.macro
-#
-#       ; references
-#
-#       (call_expression
-#           function: (identifier) @name.reference.call) @reference.call
-#
-#       (call_expression
-#           function: (field_expression
-#               field: (field_identifier) @name.reference.call)) @reference.call
-#
-#       (macro_invocation
-#           macro: (identifier) @name.reference.call) @reference.call
-#
-#       ; implementations
-#
-#       (impl_item
-#           trait: (type_identifier) @name.reference.implementation) @reference.implementation
-#
-#       (impl_item
-#           type: (type_identifier) @name.reference.implementation
-#           !trait) @reference.implementation
+  templates:
+    class_member: |
+      Member function of {{class_type}}:
+      ```rust
+      {{code}}
+      ```
+    impl_trait: |
+      Implementation of trait {{trait_type}} for {{class_type}}:
+      ```rust
+      {{code}}
+      ```

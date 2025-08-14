@@ -5,7 +5,9 @@ use ignore::{Walk, WalkBuilder};
 use itertools::Itertools;
 use log::{debug, warn};
 use serde::{Deserialize, Serialize};
+use serde_with::skip_serializing_none;
 use std::collections::BTreeMap;
+use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs::File;
@@ -18,12 +20,74 @@ use crate::parse::cb::FileMatchArgs;
 
 pub type ParsedFile = (Vec<u8>, Tree, Arc<Query>);
 
+#[skip_serializing_none]
+#[derive(Serialize, Deserialize, Debug)]
+pub struct LangTemplates {
+    pub impl_trait: Option<String>,
+    pub class_member: Option<String>,
+}
+
+#[skip_serializing_none]
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LanguageSpec {
     pub grammar_path: String,
     pub queries: BTreeMap<String, String>,
     pub extensions: Vec<String>,
     pub enabled: Option<bool>,
+    pub templates: Option<LangTemplates>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(from = "BTreeMap<String, LanguageSpec>")]
+pub struct LanguageMap {
+    languages: BTreeMap<String, LanguageSpec>,
+    ext_to_lang: BTreeMap<String, String>,
+}
+
+impl From<BTreeMap<String, LanguageSpec>> for LanguageMap {
+    fn from(languages: BTreeMap<String, LanguageSpec>) -> Self {
+        let ext_to_lang = languages
+            .iter()
+            .flat_map(|(k, v)| v.extensions.iter().map(|x| (x.clone(), k.clone())))
+            .collect();
+
+        Self {
+            languages,
+            ext_to_lang,
+        }
+    }
+}
+
+impl LanguageMap {
+    pub fn get_by_ext(&self, file_ext: &str) -> Result<(&String, &LanguageSpec)> {
+        let lang_name = self
+            .ext_to_lang
+            .get(file_ext)
+            .ok_or(anyhow!("Extension '{file_ext}' is not supported"))?;
+
+        let lang_spec = self
+            .languages
+            .get(lang_name)
+            .ok_or(anyhow!("Language '{lang_name}' is not supported"))?;
+
+        Ok((lang_name, lang_spec))
+    }
+
+    pub fn get_by_path(&self, path: impl AsRef<Path>) -> Result<(&String, &LanguageSpec)> {
+        if let Some(file_ext) = path.as_ref().extension().and_then(|x| x.to_str()) {
+            self.get_by_ext(file_ext)
+        } else {
+            Err(anyhow!("Could not determine extension"))
+        }
+    }
+}
+
+impl Deref for LanguageMap {
+    type Target = BTreeMap<String, LanguageSpec>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.languages
+    }
 }
 
 pub struct CodeSnipper {
@@ -36,8 +100,7 @@ pub struct CodeSnipper {
 #[derive(Default)]
 pub struct SourceWalker {
     pub engine: Engine,
-    pub languages: BTreeMap<String, LanguageSpec>,
-    pub ext_to_lang: BTreeMap<String, String>,
+    pub languages: LanguageMap,
     pub snippers: BTreeMap<String, CodeSnipper>,
 }
 
@@ -51,29 +114,17 @@ impl TryFrom<&str> for SourceWalker {
     }
 }
 
-// impl From<&str> for SourceWalker {
-//     fn from(value: &str) -> Self {
-//         Self::try_from(value).unwrap()
-//     }
-// }
-
 impl SourceWalker {
     pub fn new(engine: Engine) -> Self {
         Self {
             engine,
-            languages: BTreeMap::new(),
-            ext_to_lang: BTreeMap::new(),
+            languages: LanguageMap::default(),
             snippers: BTreeMap::new(),
         }
     }
 
     pub fn load_languages(&mut self, langspec: &str) -> anyhow::Result<()> {
         self.languages = serde_yml::from_str(langspec)?;
-        self.ext_to_lang = self
-            .languages
-            .iter()
-            .flat_map(|(k, v)| v.extensions.iter().map(|x| (x.clone(), k.clone())))
-            .collect();
         Ok(())
     }
 
@@ -108,17 +159,9 @@ impl SourceWalker {
     }
 
     pub async fn snipper_for_ext(&mut self, file_ext: &str) -> Result<&mut CodeSnipper> {
-        let lang_name = self
-            .ext_to_lang
-            .get(file_ext)
-            .ok_or(anyhow!("Extension '{file_ext}' is not supported"))?;
+        let (lang_name, lang_spec) = self.languages.get_by_ext(file_ext)?;
 
         if !self.snippers.contains_key(lang_name) {
-            let lang_spec = self
-                .languages
-                .get(lang_name)
-                .ok_or(anyhow!("Language '{lang_name}' is not supported"))?;
-
             self.snippers.insert(
                 lang_name.clone(),
                 Self::make_processor(&self.engine, lang_name.clone(), lang_spec).await?,
@@ -183,7 +226,7 @@ impl SourceWalker {
 
     pub fn iter_repo(&self, root: impl AsRef<Path>) -> Result<Walk> {
         let mut types_builder = TypesBuilder::new();
-        for (lang, spec) in &self.languages {
+        for (lang, spec) in self.languages.deref() {
             for ext in &spec.extensions {
                 types_builder.add(lang, &format!("*.{ext}"))?;
             }

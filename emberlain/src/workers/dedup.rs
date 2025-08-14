@@ -16,15 +16,17 @@ use typed_builder::TypedBuilder;
 
 use crate::CodeSnippet;
 use crate::SnippetProgress;
+use crate::template::Templater;
 
 #[derive(TypedBuilder)]
-pub struct DedupWorker {
+pub struct DedupWorker<'a> {
     reprocess: bool,
     qdrant: Qdrant,
     collection: String,
+    templater: Templater<'a>,
 }
 
-impl DedupWorker {
+impl<'a> DedupWorker<'a> {
     pub async fn run(
         self,
         receiver: Receiver<SnippetProgress>,
@@ -76,8 +78,8 @@ impl DedupWorker {
                     }
                 }
                 SnippetProgress::Snippet { progress, snippet } if !self.reprocess => {
+                    let snippet = self.templater.render(snippet)?;
                     let body = snippet.body();
-
                     let hash = blake3::hash(body.as_bytes()).as_bytes().to_vec();
                     let hash_hex = hex::encode(&hash);
                     let points = self
@@ -97,7 +99,7 @@ impl DedupWorker {
                     let point_ids = points.result.into_iter().filter_map(|p| p.id).collect_vec();
 
                     if !point_ids.is_empty() {
-                        log::debug!("Skipping point with hash of {hash_hex}");
+                        log::debug!("Skip existing point with hash of {hash_hex}");
                         self.qdrant
                             .delete_payload(
                                 DeletePayloadPointsBuilder::new(
