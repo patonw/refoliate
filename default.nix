@@ -29,4 +29,5 @@ in
   inherit pkgs libraries rust-toolchain;
 
   embasee = callPackage ./embasee {};
+  embcp-server = callPackage ./embcp-server {};
 }
