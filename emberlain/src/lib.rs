@@ -6,7 +6,7 @@ use qdrant_client::{
     Qdrant,
     qdrant::{
         CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, Distance, FieldType,
-        VectorParamsBuilder,
+        MultiVectorComparator, MultiVectorConfigBuilder, VectorParamsBuilder, VectorsConfigBuilder,
     },
 };
 use rig::{agent::Agent, completion::Prompt, providers::ollama};
@@ -191,10 +191,22 @@ pub fn get_agent_factory(config: &Config) -> Result<AgentFactory> {
 
 pub async fn init_collection(client: &Qdrant, collection: &str, dims: u64) -> Result<()> {
     if !client.collection_exists(collection).await? {
+        // let vectors_config = VectorParamsBuilder::new(dims, Distance::Cosine);
+        let mut vectors_config = VectorsConfigBuilder::default();
+        vectors_config.add_named_vector_params(
+            "default",
+            VectorParamsBuilder::new(dims, Distance::Cosine).build(),
+        );
+        vectors_config.add_named_vector_params(
+            "aliases",
+            VectorParamsBuilder::new(dims, Distance::Cosine)
+                .multivector_config(MultiVectorConfigBuilder::new(MultiVectorComparator::MaxSim))
+                .build(),
+        );
+
         client
             .create_collection(
-                CreateCollectionBuilder::new(collection)
-                    .vectors_config(VectorParamsBuilder::new(dims, Distance::Cosine)),
+                CreateCollectionBuilder::new(collection).vectors_config(vectors_config),
             )
             .await?;
     }

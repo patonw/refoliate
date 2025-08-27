@@ -3,12 +3,10 @@ use cached::proc_macro::cached;
 use egui::emath::Numeric;
 use fastembed::{EmbeddingModel, TextEmbedding};
 use itertools::{Itertools, izip};
-use qdrant_client::Qdrant;
 use qdrant_client::qdrant::point_id::PointIdOptions;
 use qdrant_client::qdrant::vectors_output::VectorsOptions;
-use qdrant_client::qdrant::{
-    GetPointsBuilder, PointId, QueryPointsBuilder, ScrollPointsBuilder, vectors_config,
-};
+use qdrant_client::qdrant::{GetPointsBuilder, PointId, QueryPointsBuilder, ScrollPointsBuilder};
+use qdrant_client::{Qdrant, qdrant::vectors_config::Config as VecConfig};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -30,7 +28,7 @@ use egui::{
 };
 use egui_plot::{MarkerShape, Plot, PlotResponse, Points};
 
-use embasee::{optzip, pydict, pyimport};
+use embasee::{get_vectors_config, optzip, pydict, pyimport};
 
 // TODO: set fastembed cache using XDG cache dir
 
@@ -222,11 +220,8 @@ impl MyEguiApp {
         let task_count = self.task_count.clone();
         let umap_lock = self.umap.clone();
 
-        let (collection_name, model_id) = if let Ok(app_state) = self.app_state.lock() {
-            (
-                app_state.collection_name.clone(),
-                app_state.semantic.embed_model.clone(),
-            )
+        let model_id = if let Ok(app_state) = self.app_state.lock() {
+            app_state.semantic.embed_model.clone()
         } else {
             return;
         };
@@ -289,7 +284,7 @@ impl MyEguiApp {
             let resp = qdclient
                 .scroll(
                     ScrollPointsBuilder::new(collection_name.as_str())
-                        .limit(1000)
+                        .limit(10_000)
                         .with_payload(true)
                         .with_vectors(true),
                 )
@@ -307,7 +302,10 @@ impl MyEguiApp {
                     .filter_map(|p| p.id.as_ref().zip(p.vectors.as_ref()))
                     .filter_map(|(k, v)| match v.vectors_options.as_ref().unwrap() {
                         VectorsOptions::Vector(vector) => Some((k, &vector.data)),
-                        _ => None,
+                        VectorsOptions::Vectors(vectors) => {
+                            // TODO: config for "default" vector
+                            vectors.vectors.get("default").map(|d| (k, &d.data))
+                        }
                     })
                     .filter_map(|(k, v)| match k.point_id_options.as_ref() {
                         Some(PointIdOptions::Num(id)) => Some((format!("{id}"), v)),
@@ -485,15 +483,25 @@ impl MyEguiApp {
                 }
             });
 
-            // Continue async coro by querying Qdrant to get n_neighbors
-            let resp = qdclient
-                .query(
-                    QueryPointsBuilder::new(collection_name.as_str())
-                        .query(embedding.clone())
-                        .limit(10),
-                )
+            let vec_config = get_vectors_config(qdclient.as_ref(), &collection_name)
                 .await
+                .map_err(|e| e.to_string())
                 .unwrap();
+
+            // Continue async coro by querying Qdrant to get n_neighbors
+            let query = QueryPointsBuilder::new(collection_name.as_str())
+                .query(embedding.clone())
+                .limit(10);
+
+            let query = if let VecConfig::ParamsMap(_params) = vec_config {
+                // TODO: pull alias from config
+                // TODO: Check params has key
+                query.using("aliases")
+            } else {
+                query
+            };
+
+            let resp = qdclient.query(query).await.unwrap();
 
             // Stringify ids of neighbors
             let matched_ids = resp
@@ -689,20 +697,19 @@ impl MyEguiApp {
                         .show(ui, |ui| match v {
                             Value::String(s) => ui.label(s),
                             Value::Array(values) => {
-                                egui::Grid::new("attr_grid")
-                                    .num_columns(1)
-                                    .striped(true)
-                                    .show(ui, |ui| {
-                                        for value in values {
-                                            if let Some(text) = value.as_str() {
-                                                ui.label(text);
-                                            } else {
-                                                ui.label(format!("{value}"));
-                                            }
-                                            ui.end_row();
+                                ui.vertical(|ui| {
+                                    let font_id = egui::TextStyle::Body.resolve(ui.style());
+                                    ui.spacing_mut().item_spacing.y = font_id.size / 2.0;
+
+                                    for value in values {
+                                        if let Some(text) = value.as_str() {
+                                            ui.label(text);
+                                        } else {
+                                            ui.label(format!("{value}"));
                                         }
-                                    })
-                                    .response
+                                    }
+                                })
+                                .response
                             }
                             Value::Object(data) => {
                                 egui::Grid::new("attr_grid")
@@ -1041,22 +1048,22 @@ async fn refresh_collection_info(app_state: Arc<Mutex<AppState>>, qdclient: Arc<
         .ok()
         .and_then(|s| s.collection_name.clone());
 
-    if let Some(name) = selected_collection
-        && let Ok(info) = qdclient.collection_info(name).await
-    {
-        log::info!("Collection info: {info:?}");
-
-        // Okay, this is just a tad ridiculous...
-        if let Ok(mut app_state) = app_state.lock()
-            && let Some(vectors_config::Config::Params(params)) = info
-                .result
-                .and_then(|i| i.config)
-                .and_then(|i| i.params)
-                .and_then(|i| i.vectors_config)
-                .and_then(|i| i.config)
-        {
-            app_state.embed_dims = dbg!(params.size as usize);
+    let embed_dims = if let Some(collection_name) = selected_collection {
+        match get_vectors_config(qdclient.as_ref(), &collection_name).await {
+            Ok(VecConfig::Params(params)) => Some(params.size),
+            Ok(VecConfig::ParamsMap(params)) if params.map.contains_key("default") => {
+                params.map.get("default").map(|p| p.size)
+            }
+            _ => None,
         }
+    } else {
+        None
+    };
+
+    if let Some(size) = embed_dims
+        && let Ok(mut app_state) = app_state.lock()
+    {
+        app_state.embed_dims = dbg!(size as usize);
     }
 }
 
@@ -1146,6 +1153,13 @@ fn project_embeddings(
                 };
 
                 let df = df.drop("uuid").unwrap();
+                let (num_rows, _) = df.shape();
+                let df = if num_rows > 1000 {
+                    df.sample_n_literal(1000, false, false, None).unwrap_or(df)
+                } else {
+                    df
+                };
+
                 let umap = umap.call_method1("fit", (PyDataFrame(df),)).unwrap();
 
                 *umap_guard = Some(umap.clone().unbind());

@@ -1,8 +1,13 @@
+use anyhow::Context as _;
+use cached::proc_macro::cached;
 use fastembed::TextEmbedding;
 use itertools::Itertools;
 use qdrant_client::{
     Qdrant,
-    qdrant::{Condition, Filter, QueryPointsBuilder, with_payload_selector::SelectorOptions},
+    qdrant::{
+        Condition, Filter, QueryPointsBuilder, vectors_config::Config as VecConfig,
+        with_payload_selector::SelectorOptions,
+    },
 };
 use rmcp::{
     Json, ServiceExt,
@@ -15,6 +20,7 @@ use rmcp::{
     transport::stdio,
 };
 use serde_with::skip_serializing_none;
+use std::time::Duration;
 use typed_builder::TypedBuilder;
 
 use crate::config::{Config, get_embed_info};
@@ -48,6 +54,29 @@ pub struct QdrantTool {
     collection: String,
 }
 
+#[cached(
+    convert = r##"{ format!("{collection}") }"##,
+    key = "String",
+    time = 10,
+    result = true
+)]
+async fn get_vectors_config(client: &Qdrant, collection: String) -> anyhow::Result<VecConfig> {
+    let meta = client.collection_info(collection).await?;
+    let vectors_config: VecConfig = meta
+        .result
+        .context("No result")?
+        .config
+        .context("No config")?
+        .params
+        .context("No params")?
+        .vectors_config
+        .context("No vectors config")?
+        .config
+        .context("No config")?;
+
+    Ok(vectors_config)
+}
+
 #[tool_router]
 impl QdrantTool {
     #[tool(description = "Search document by semantic query")]
@@ -57,26 +86,34 @@ impl QdrantTool {
     ) -> Result<Json<SearchResponse>, String> {
         let Parameters(SearchRequest { text, limit }) = params;
 
+        let vec_config = get_vectors_config(&self.client, self.collection.clone())
+            .await
+            .map_err(|e| e.to_string())?;
         let mut embeds = self
             .embedder
             .embed(vec![text], None)
             .map_err(|e| e.to_string())?;
+
         let embedding = embeds.remove(0);
 
-        let resp = self
-            .client
-            .query(
-                QueryPointsBuilder::new(self.collection.as_str())
-                    .query(embedding.clone())
-                    .with_payload(SelectorOptions::Exclude(
-                        vec!["id".to_string(), "hash".to_string()].into(),
-                    ))
-                    .filter(Filter::must([Condition::is_empty("__removed")]))
-                    .limit(limit.unwrap_or(5)),
-            )
-            .await
-            .unwrap();
-        let result = resp
+        let query = QueryPointsBuilder::new(self.collection.as_str())
+            .query(embedding.clone())
+            .with_payload(SelectorOptions::Exclude(
+                vec!["id".to_string(), "hash".to_string()].into(),
+            ))
+            .filter(Filter::must([Condition::is_empty("__removed")]))
+            .limit(limit.unwrap_or(5));
+
+        let query = if let VecConfig::ParamsMap(_params) = vec_config {
+            // TODO: pull alias from config
+            // TODO: Check params has key
+            query.using("aliases")
+        } else {
+            query
+        };
+
+        let resp = self.client.query(query).await.unwrap();
+        let data = resp
             .result
             .iter()
             .filter_map(|point| {
@@ -84,7 +121,7 @@ impl QdrantTool {
             })
             .collect_vec();
 
-        Ok(Json(SearchResponse { data: result }))
+        Ok(Json(SearchResponse { data }))
     }
 }
 

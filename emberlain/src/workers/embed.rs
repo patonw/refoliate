@@ -3,9 +3,9 @@ use flume::Receiver;
 use log::{info, warn};
 use qdrant_client::{
     Payload, Qdrant,
-    qdrant::{PointStruct, UpsertPointsBuilder},
+    qdrant::{PointStruct, UpsertPointsBuilder, Vector},
 };
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use typed_builder::TypedBuilder;
 
 use crate::CodeSnippet;
@@ -39,7 +39,15 @@ impl EmbeddingWorker {
                 let value = serde_json::to_value(msg)?;
                 let payload = Payload::try_from(value)?;
 
-                let point = PointStruct::new(id, embedding, payload);
+                let vectors = HashMap::from([
+                    ("default".to_string(), Vector::new_dense(embedding.clone())),
+                    (
+                        "aliases".to_string(),
+                        Vector::new_multi(vec![embedding.clone()]),
+                    ),
+                ]);
+                let point = PointStruct::new(id, vectors, payload);
+
                 let request =
                     UpsertPointsBuilder::new(self.collection.as_str(), vec![point]).build();
                 self.qdrant.upsert_points(request).await?;
