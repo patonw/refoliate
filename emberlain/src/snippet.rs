@@ -25,7 +25,7 @@ fn make_id_hash(
 
 #[serde_as]
 #[skip_serializing_none]
-#[derive(Embed, serde::Deserialize, serde::Serialize, Debug, Clone)]
+#[derive(Embed, serde::Deserialize, serde::Serialize, Debug, Clone, Default)]
 pub struct CodeSnippet {
     /// If the file is in a repository, this is relative to the repo root.
     /// Otherwise, relative to the target path argument.
@@ -54,6 +54,8 @@ pub struct CodeSnippet {
 
     #[serde(skip_serializing)]
     pub rendered: String,
+
+    pub queries: Vec<String>,
 }
 
 impl CodeSnippet {

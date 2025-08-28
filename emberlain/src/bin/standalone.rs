@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use emberlain::LanguageMap;
 use emberlain::template::Templater;
+use emberlain::workers::progress::ProgressWorker;
 use emberlain::workers::prune::PruningWorker;
+use emberlain::workers::synthesize::SynthWorker;
 use fastembed::{EmbeddingModel, ModelInfo, TextEmbedding};
 use indicatif_log_bridge::LogWrapper;
 use log::debug;
@@ -14,7 +16,7 @@ use tracing_log::LogTracer;
 use tracing_subscriber::EnvFilter;
 
 use emberlain::{
-    Config, Progressor, SnippetProgress, SourceWalker, get_agent_factory, init_collection,
+    Config, Progressor, SourceWalker, get_agent_factory, init_collection,
     workers::{
         dedup::DedupWorker, embed::EmbeddingWorker, extract::ExtractingWorker,
         summarize::SummaryWorker,
@@ -155,11 +157,18 @@ async fn main() -> Result<()> {
             .with_cache_dir(CONFIG.fastembed_cache.as_ref().unwrap().into()),
     )?);
 
+    let synth_worker = SynthWorker::builder()
+        .agent(agent_factory.build())
+        .enabled(CONFIG.synthetics.unwrap_or_default())
+        .build();
+
     let embedder = EmbeddingWorker::builder()
         .embedding(embed_model.clone())
         .qdrant(qdrant_client.clone())
         .collection(CONFIG.collection.clone().unwrap())
         .build();
+
+    let progress_worker = ProgressWorker::builder().build();
 
     let pruner = CONFIG.pruning_cutoff()?.map(|dt| {
         PruningWorker::builder()
@@ -186,9 +195,11 @@ async fn main() -> Result<()> {
     }
 
     // hmm, is capacity per receiver, sender or total?
-    let (snippet_tx, snippet_rx) = flume::bounded::<SnippetProgress>(4);
-    let (dedup_tx, dedup_rx) = flume::bounded::<SnippetProgress>(4);
+    let (snippet_tx, snippet_rx) = flume::bounded(4);
+    let (dedup_tx, dedup_rx) = flume::bounded(4);
     let (summary_tx, summary_rx) = flume::bounded(4);
+    let (synth_tx, synth_rx) = flume::bounded(4);
+    let (embed_tx, embed_rx) = flume::bounded(4);
 
     // Launch all workers
 
@@ -230,17 +241,33 @@ async fn main() -> Result<()> {
     drop(dedup_rx); // Otherwise won't automatically exit since channels still in scope
     drop(summary_tx);
 
+    let synth_task = spawn(async move {
+        if let Err(err) = synth_worker.run(summary_rx, synth_tx).await {
+            log::error!("{err:?}");
+            exit(1);
+        }
+    });
+
+    let mut progress_channel = embed_rx;
+
     let embed_task = if !CONFIG.dry_run.unwrap_or(false) {
         Some(spawn(async move {
-            if let Err(err) = embedder.run(summary_rx).await {
+            if let Err(err) = embedder.run(synth_rx, embed_tx).await {
                 log::error!("{err:?}");
                 exit(1);
             }
         }))
     } else {
-        drop(summary_rx);
+        progress_channel = synth_rx;
         None
     };
+
+    let progress_task = spawn(async move {
+        if let Err(err) = progress_worker.run(progress_channel).await {
+            log::error!("{err:?}");
+            exit(1);
+        }
+    });
 
     local.await;
     debug!("Extraction workers done");
@@ -251,10 +278,14 @@ async fn main() -> Result<()> {
     let summary_errs = summary_tasks.join_all().await;
     debug!("Summary workers done: {summary_errs:?}",);
 
+    debug!("Synthesizer worker done: {:?}", synth_task.await.err());
+
     if let Some(embed_task) = embed_task {
         let embed_errs = embed_task.await.err();
         debug!("Embed workers done: {embed_errs:?}");
     }
+
+    debug!("Progress worker done: {:?}", progress_task.await.err());
 
     if let Some(pruner) = pruner {
         pruner.run().await?;

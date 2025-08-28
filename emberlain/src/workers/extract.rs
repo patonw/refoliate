@@ -165,8 +165,6 @@ async fn extract_file(
                 body = Some(txt.to_string());
             }
 
-            let rendered = String::new();
-
             // log::debug!("o.O Match results kind: {kind:?} identier: {ident:?} attrs: {attrs:?}");
             if let Some(body) = &body {
                 let snippet = CodeSnippet {
@@ -176,9 +174,7 @@ async fn extract_file(
                     attributes: attrs,
                     name: ident.clone().unwrap_or("???".to_string()),
                     body: body.clone(),
-                    summary: "".to_string(),
-                    hash: Default::default(),
-                    rendered,
+                    ..Default::default()
                 };
 
                 let msg = SnippetProgress::Snippet {

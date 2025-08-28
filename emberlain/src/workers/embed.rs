@@ -1,5 +1,5 @@
 use fastembed::TextEmbedding;
-use flume::Receiver;
+use flume::{Receiver, Sender};
 use log::{info, warn};
 use qdrant_client::{
     Payload, Qdrant,
@@ -8,7 +8,7 @@ use qdrant_client::{
 use std::{collections::HashMap, sync::Arc};
 use typed_builder::TypedBuilder;
 
-use crate::CodeSnippet;
+use crate::SnippetProgress;
 
 #[derive(TypedBuilder)]
 pub struct EmbeddingWorker {
@@ -18,47 +18,52 @@ pub struct EmbeddingWorker {
 }
 
 impl EmbeddingWorker {
-    pub async fn run(&self, receiver: Receiver<CodeSnippet>) -> anyhow::Result<()> {
+    pub async fn run(
+        &self,
+        receiver: Receiver<SnippetProgress>,
+        sender: Sender<SnippetProgress>,
+    ) -> anyhow::Result<()> {
         while let Ok(msg) = receiver.recv_async().await {
-            let result = async {
-                let options = textwrap::Options::new(100)
-                    .initial_indent(">.< ")
-                    .subsequent_indent("-.- ");
+            if let SnippetProgress::Snippet { snippet, .. } = &msg {
+                let result = async {
+                    let options = textwrap::Options::new(100)
+                        .initial_indent(">.< ")
+                        .subsequent_indent("-.- ");
 
-                info!("X.X ID = {:?}", msg.uuid());
-                info!("{}", textwrap::fill(&msg.summary, &options));
+                    info!("X.X ID = {:?}", snippet.uuid());
+                    info!("{}", textwrap::fill(&snippet.summary, &options));
 
-                // this could be cleaner
-                let embedding = self
-                    .embedding
-                    .embed(vec![&msg.summary], None)?
-                    .pop()
-                    .unwrap();
+                    // this could be cleaner
+                    let mut texts = vec![snippet.summary.as_str()];
+                    texts.extend(snippet.queries.iter().map(|s| s.as_str()));
 
-                let id = msg.uuid()?.to_string();
-                let value = serde_json::to_value(msg)?;
-                let payload = Payload::try_from(value)?;
+                    let embeddings = self.embedding.embed(texts, None)?;
+                    let embedding = embeddings[0].clone();
 
-                let vectors = HashMap::from([
-                    ("default".to_string(), Vector::new_dense(embedding.clone())),
-                    (
-                        "aliases".to_string(),
-                        Vector::new_multi(vec![embedding.clone()]),
-                    ),
-                ]);
-                let point = PointStruct::new(id, vectors, payload);
+                    let id = snippet.uuid()?.to_string();
+                    let value = serde_json::to_value(snippet)?;
+                    let payload = Payload::try_from(value)?;
 
-                let request =
-                    UpsertPointsBuilder::new(self.collection.as_str(), vec![point]).build();
-                self.qdrant.upsert_points(request).await?;
+                    let vectors = HashMap::from([
+                        ("default".to_string(), Vector::new_dense(embedding)),
+                        ("aliases".to_string(), Vector::new_multi(embeddings)),
+                    ]);
+                    let point = PointStruct::new(id, vectors, payload);
 
-                Ok::<_, anyhow::Error>(())
+                    let request =
+                        UpsertPointsBuilder::new(self.collection.as_str(), vec![point]).build();
+                    self.qdrant.upsert_points(request).await?;
+
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+
+                if let Err(e) = result {
+                    warn!("Unable to handle snippet: {e:?}");
+                };
             }
-            .await;
 
-            if let Err(e) = result {
-                warn!("Unable to handle snippet: {e:?}");
-            };
+            sender.send_async(msg).await.unwrap();
         }
 
         Ok(())

@@ -46,6 +46,10 @@ pub struct Config {
     #[arg(long)]
     pub summary_workers: Option<u32>,
 
+    /// Augment each entry with synthetic queries to improve semantic searches.
+    #[arg(long, action=clap::ArgAction::SetTrue)]
+    pub synthetics: Option<bool>,
+
     /// Instructions given to the summary agent describing its persona.
     ///
     /// Using a heredoc or multiline config string is recommended over a program argument.
@@ -99,6 +103,7 @@ impl Default for Config {
             reprocess: Default::default(),
             prune: Default::default(),
             summary_workers: Some(1),
+            synthetics: Default::default(),
             persona: None,
             llm_model: Some("devstral:latest".into()),
             llm_base_url: Some("http://localhost:11434".into()),
