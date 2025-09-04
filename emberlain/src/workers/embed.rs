@@ -3,7 +3,7 @@ use flume::{Receiver, Sender};
 use log::{info, warn};
 use qdrant_client::{
     Payload, Qdrant,
-    qdrant::{PointStruct, UpsertPointsBuilder, Vector},
+    qdrant::{DeletePayloadPointsBuilder, PointStruct, PointsIdsList, UpsertPointsBuilder, Vector},
 };
 use std::{
     collections::HashMap,
@@ -27,47 +27,63 @@ impl EmbeddingWorker {
         sender: Sender<SnippetProgress>,
     ) -> anyhow::Result<()> {
         while let Ok(msg) = receiver.recv_async().await {
-            if let SnippetProgress::Snippet { snippet, .. } = &msg {
-                let result = async {
-                    let options = textwrap::Options::new(100)
-                        .initial_indent(">.< ")
-                        .subsequent_indent("-.- ");
-
-                    info!("X.X ID = {:?}", snippet.uuid());
-                    info!("{}", textwrap::fill(&snippet.summary, &options));
-
-                    // this could be cleaner
-                    let mut texts = vec![snippet.summary.as_str()];
-                    texts.extend(snippet.queries.iter().map(|s| s.as_str()));
-
-                    let embeddings = {
-                        let mut embedder = self.embedding.lock().unwrap();
-                        embedder.embed(texts, None)?
-                    };
-
-                    let embedding = embeddings[0].clone();
-
+            if let SnippetProgress::Snippet { snippet, clean, .. } = &msg {
+                if *clean {
+                    // when clean, just unmark __removed
                     let id = snippet.uuid()?.to_string();
-                    let value = serde_json::to_value(snippet)?;
-                    let payload = Payload::try_from(value)?;
+                    self.qdrant
+                        .delete_payload(
+                            DeletePayloadPointsBuilder::new(
+                                &self.collection,
+                                vec!["__removed".into()],
+                            )
+                            .points_selector(PointsIdsList {
+                                ids: vec![id.into()],
+                            }),
+                        )
+                        .await?;
+                } else {
+                    let result = async {
+                        let options = textwrap::Options::new(100)
+                            .initial_indent(">.< ")
+                            .subsequent_indent("-.- ");
 
-                    let vectors = HashMap::from([
-                        ("default".to_string(), Vector::new_dense(embedding)),
-                        ("aliases".to_string(), Vector::new_multi(embeddings)),
-                    ]);
-                    let point = PointStruct::new(id, vectors, payload);
+                        info!("X.X ID = {:?}", snippet.uuid());
+                        info!("{}", textwrap::fill(&snippet.summary, &options));
 
-                    let request =
-                        UpsertPointsBuilder::new(self.collection.as_str(), vec![point]).build();
-                    self.qdrant.upsert_points(request).await?;
+                        // this could be cleaner
+                        let mut texts = vec![snippet.summary.as_str()];
+                        texts.extend(snippet.queries.iter().map(|s| s.as_str()));
 
-                    Ok::<_, anyhow::Error>(())
+                        let embeddings = {
+                            let mut embedder = self.embedding.lock().unwrap();
+                            embedder.embed(texts, None)?
+                        };
+
+                        let embedding = embeddings[0].clone();
+
+                        let id = snippet.uuid()?.to_string();
+                        let value = serde_json::to_value(snippet)?;
+                        let payload = Payload::try_from(value)?;
+
+                        let vectors = HashMap::from([
+                            ("default".to_string(), Vector::new_dense(embedding)),
+                            ("aliases".to_string(), Vector::new_multi(embeddings)),
+                        ]);
+                        let point = PointStruct::new(id, vectors, payload);
+
+                        let request =
+                            UpsertPointsBuilder::new(self.collection.as_str(), vec![point]).build();
+                        self.qdrant.upsert_points(request).await?;
+
+                        Ok::<_, anyhow::Error>(())
+                    }
+                    .await;
+
+                    if let Err(e) = result {
+                        warn!("Unable to handle snippet: {e:?}");
+                    };
                 }
-                .await;
-
-                if let Err(e) = result {
-                    warn!("Unable to handle snippet: {e:?}");
-                };
             }
 
             sender.send_async(msg).await.unwrap();

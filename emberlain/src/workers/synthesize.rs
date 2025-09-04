@@ -19,6 +19,9 @@ pub struct SynthWorker<T: DynExtractor<Synthetics>> {
 
     #[builder(default)]
     enabled: bool,
+
+    #[builder(default)]
+    reprocess: bool,
 }
 
 impl<T: DynExtractor<Synthetics>> SynthWorker<T> {
@@ -31,15 +34,21 @@ impl<T: DynExtractor<Synthetics>> SynthWorker<T> {
 
         while let Ok(msg) = receiver.recv_async().await {
             match msg {
-                SnippetProgress::Snippet { progress, snippet }
-                    if self.enabled && !snippet.summary.is_empty() =>
+                SnippetProgress::Snippet {
+                    progress, snippet, ..
+                } if (self.enabled && !snippet.summary.is_empty())
+                    && (self.reprocess || snippet.queries.is_empty()) =>
                 {
+                    log::info!("Synthesizing queries for {snippet:?}");
                     let snippet = match extractor.extract(&snippet.summary).await {
                         Ok(synthetics) => {
                             let queries = synthetics.queries;
                             log::info!("Synthetics: {queries:?}");
 
-                            CodeSnippet { queries, ..snippet }
+                            Box::new(CodeSnippet {
+                                queries,
+                                ..*snippet
+                            })
                         }
                         Err(err) => {
                             log::warn!("Could not synthesize queries: {err:?}");
@@ -48,7 +57,11 @@ impl<T: DynExtractor<Synthetics>> SynthWorker<T> {
                     };
 
                     sender
-                        .send_async(SnippetProgress::Snippet { progress, snippet })
+                        .send_async(SnippetProgress::Snippet {
+                            progress,
+                            snippet,
+                            clean: false,
+                        })
                         .await?;
                 }
                 _ => {

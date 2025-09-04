@@ -179,7 +179,8 @@ async fn extract_file(
 
                 let msg = SnippetProgress::Snippet {
                     progress: progress.clone(),
-                    snippet,
+                    snippet: Box::new(snippet),
+                    clean: true,
                 };
 
                 snip_tx.send_async(msg).await.unwrap();

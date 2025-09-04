@@ -143,6 +143,7 @@ async fn main() -> Result<()> {
             let agent = agent.unwrap().build();
             SummaryWorker::builder()
                 .agent(agent)
+                .reprocess(CONFIG.reprocess.unwrap_or_default())
                 .dry_run(CONFIG.dry_run.unwrap_or_default())
                 .build()
         })
@@ -159,6 +160,7 @@ async fn main() -> Result<()> {
     let synth_worker = SynthWorker::builder()
         .extractor(agent_factory.extractor()?.build())
         .enabled(CONFIG.synthetics.unwrap_or_default())
+        .reprocess(CONFIG.reprocess.unwrap_or_default())
         .build();
 
     let embedder = EmbeddingWorker::builder()

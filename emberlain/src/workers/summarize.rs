@@ -11,6 +11,9 @@ pub struct SummaryWorker<A: DynAgent> {
 
     #[builder(default)]
     dry_run: bool,
+
+    #[builder(default)]
+    reprocess: bool,
 }
 
 impl<A: DynAgent> SummaryWorker<A> {
@@ -23,7 +26,7 @@ impl<A: DynAgent> SummaryWorker<A> {
             match msg {
                 SnippetProgress::Snippet {
                     progress, snippet, ..
-                } => {
+                } if snippet.summary.is_empty() || self.reprocess => {
                     // Skip trivial declarations: one-liners, aliases, forward declarations, etc.
                     if snippet.body.lines().count() <= 4 {
                         // TODO: principled cutoff logic. Ideally exclude code with a single
@@ -41,12 +44,16 @@ impl<A: DynAgent> SummaryWorker<A> {
                     if !self.dry_run {
                         match self.agent.prompt(&body).await {
                             Ok(resp) => {
-                                let snippet = CodeSnippet {
+                                let snippet = Box::new(CodeSnippet {
                                     summary: resp,
-                                    ..snippet
-                                };
+                                    ..*snippet
+                                });
                                 sender
-                                    .send_async(SnippetProgress::Snippet { snippet, progress })
+                                    .send_async(SnippetProgress::Snippet {
+                                        snippet,
+                                        progress,
+                                        clean: false,
+                                    })
                                     .await
                                     .unwrap();
                             }

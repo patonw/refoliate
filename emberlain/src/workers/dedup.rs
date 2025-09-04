@@ -6,7 +6,6 @@ use log::debug;
 use qdrant_client::Payload;
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::Condition;
-use qdrant_client::qdrant::DeletePayloadPointsBuilder;
 use qdrant_client::qdrant::Filter;
 use qdrant_client::qdrant::PointsIdsList;
 use qdrant_client::qdrant::ScrollPointsBuilder;
@@ -77,56 +76,93 @@ impl<'a> DedupWorker<'a> {
                         progress,
                     }
                 }
-                SnippetProgress::Snippet { progress, snippet } if !self.reprocess => {
-                    let snippet = self.templater.render(snippet)?;
+                SnippetProgress::Snippet {
+                    progress, snippet, ..
+                } if !self.reprocess => {
+                    let snippet = self.templater.render(*snippet)?;
                     let body = snippet.body();
                     let hash = blake3::hash(body.as_bytes()).as_bytes().to_vec();
                     let hash_hex = hex::encode(&hash);
                     let points = self
                         .qdrant
                         .scroll(
-                            ScrollPointsBuilder::new(&self.collection).filter(Filter::must([
-                                // Maybe too strict?
-                                Condition::matches("path", snippet.path.clone()),
-                                // Something wrong with path field, not 100% match...
-                                // ah, multiple instances of the contents exist, causing collisions
-                                Condition::matches("name", snippet.name.clone()),
-                                Condition::matches("hash", hash_hex.clone()),
-                            ])),
+                            ScrollPointsBuilder::new(&self.collection)
+                                .filter(Filter::must([
+                                    // Maybe too strict?
+                                    Condition::matches("path", snippet.path.clone()),
+                                    // Something wrong with path field, not 100% match...
+                                    // ah, multiple instances of the contents exist, causing collisions
+                                    Condition::matches("name", snippet.name.clone()),
+                                    Condition::matches("hash", hash_hex.clone()),
+                                ]))
+                                .with_payload(true),
                         )
                         .await?;
 
-                    let point_ids = points.result.into_iter().filter_map(|p| p.id).collect_vec();
+                    let snippet = if !points.result.is_empty() {
+                        log::debug!(
+                            "Existing point with hash of {hash_hex}: {:?}",
+                            points.result
+                        );
 
-                    if !point_ids.is_empty() {
-                        log::debug!("Skip existing point with hash of {hash_hex}");
-                        self.qdrant
-                            .delete_payload(
-                                DeletePayloadPointsBuilder::new(
-                                    &self.collection,
-                                    vec!["__removed".to_string()],
-                                )
-                                .points_selector(PointsIdsList { ids: point_ids })
-                                .wait(true),
+                        if points.result.len() > 1 {
+                            let point_ids = points
+                                .result
+                                .iter()
+                                .filter_map(|p| p.id.clone())
+                                .collect_vec();
+                            log::warn!(
+                                "Too many matching points for snippet {snippet:?}: {point_ids:?}",
                             )
-                            .await?;
-                        progress
-                            .as_ref()
-                            .inspect(|p| p.inc(snippet.body.len() as u64));
+                        }
 
-                        // don't send dups unless reprocessing
-                        continue;
-                    }
+                        let point = points.result.first().unwrap();
 
-                    log::info!(
-                        "New snippet. path: {} name: {} hash: {}",
-                        &snippet.path,
-                        &snippet.name,
-                        &hash_hex
+                        let summary = point
+                            .payload
+                            .get("summary")
+                            .and_then(|v| v.as_str())
+                            .cloned()
+                            .unwrap_or_default();
+
+                        let queries: Vec<String> = point
+                            .payload
+                            .get("queries")
+                            .and_then(|v| {
+                                let value = v.clone().into_json();
+                                let queries = serde_json::from_value::<Vec<String>>(value);
+                                queries.ok()
+                            })
+                            .unwrap_or_default();
+
+                        // log::debug!("Retrieved summary: {summary}\nqueries: {queries:?}");
+
+                        CodeSnippet {
+                            hash,
+                            summary,
+                            queries,
+                            ..snippet
+                        }
+                    } else {
+                        log::info!(
+                            "New snippet. path: {} name: {} hash: {}",
+                            &snippet.path,
+                            &snippet.name,
+                            &hash_hex
+                        );
+                        CodeSnippet { hash, ..snippet }
+                    };
+
+                    log::debug!(
+                        "Merged snippet: {}",
+                        serde_json::to_string_pretty(&snippet).unwrap_or("???".to_string())
                     );
-                    // Otherwise, this is new, so process normally
-                    let snippet = CodeSnippet { hash, ..snippet };
-                    SnippetProgress::Snippet { progress, snippet }
+
+                    SnippetProgress::Snippet {
+                        progress,
+                        snippet: Box::new(snippet),
+                        clean: true,
+                    }
                 }
                 _ => msg,
             };

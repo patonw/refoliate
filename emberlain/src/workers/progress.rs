@@ -52,7 +52,9 @@ impl ProgressWorker {
                         });
                     }
                 }
-                SnippetProgress::Snippet { progress, snippet } => {
+                SnippetProgress::Snippet {
+                    progress, snippet, ..
+                } => {
                     let count = snippet.body.len();
                     progress.as_ref().inspect(|p| p.inc(count as u64));
                 }

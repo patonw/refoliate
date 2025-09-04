@@ -90,7 +90,8 @@ pub enum SnippetProgress {
     },
     Snippet {
         progress: Option<ProgressBar>,
-        snippet: CodeSnippet,
+        snippet: Box<CodeSnippet>,
+        clean: bool,
     },
     EndOfFile {
         progressor: Arc<Option<Progressor>>,
