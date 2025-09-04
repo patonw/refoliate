@@ -1,9 +1,9 @@
-use anyhow::{Context, Result};
-use emberlain::LanguageMap;
+use anyhow::Result;
 use emberlain::template::Templater;
 use emberlain::workers::progress::ProgressWorker;
 use emberlain::workers::prune::PruningWorker;
 use emberlain::workers::synthesize::SynthWorker;
+use emberlain::{AgentFactory, LanguageMap};
 use fastembed::{EmbeddingModel, ModelInfo, TextEmbedding};
 use indicatif_log_bridge::LogWrapper;
 use log::debug;
@@ -16,7 +16,7 @@ use tracing_log::LogTracer;
 use tracing_subscriber::EnvFilter;
 
 use emberlain::{
-    Config, Progressor, SourceWalker, get_agent_factory, init_collection,
+    Config, Progressor, SourceWalker, init_collection,
     workers::{
         dedup::DedupWorker, embed::EmbeddingWorker, extract::ExtractingWorker,
         summarize::SummaryWorker,
@@ -126,11 +126,6 @@ async fn main() -> Result<()> {
     init_collection(&qdrant_client, COLLECTION_NAME.as_str(), *EMBED_DIMS as u64).await?;
 
     let mut extractor = ExtractingWorker::builder().walker(src_walker).build();
-    reqwest::get(CONFIG.llm_base_url.as_ref().unwrap())
-        .await
-        .context("Unable to connect to LLM provider")?
-        .text()
-        .await?;
 
     let deduper = DedupWorker::builder()
         .templater(templater)
@@ -139,13 +134,15 @@ async fn main() -> Result<()> {
         .collection(CONFIG.collection.clone().unwrap())
         .build();
 
-    let agent_factory = get_agent_factory(&CONFIG)?;
-    agent_factory.check().await?;
+    let agent_factory = AgentFactory::new(&CONFIG);
+    // agent_factory.verify().await?; // TODO: implement verification
 
     let summarizers = (0..CONFIG.summary_workers.unwrap_or(1))
         .map(|_| {
+            let agent = agent_factory.summarizer();
+            let agent = agent.unwrap().build();
             SummaryWorker::builder()
-                .agent(agent_factory.build())
+                .agent(agent)
                 .dry_run(CONFIG.dry_run.unwrap_or_default())
                 .build()
         })
@@ -158,7 +155,7 @@ async fn main() -> Result<()> {
     )?);
 
     let synth_worker = SynthWorker::builder()
-        .agent(agent_factory.build())
+        .extractor(agent_factory.extractor()?.build())
         .enabled(CONFIG.synthetics.unwrap_or_default())
         .build();
 

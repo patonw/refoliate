@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indoc::indoc;
@@ -9,8 +9,16 @@ use qdrant_client::{
         MultiVectorComparator, MultiVectorConfigBuilder, VectorParamsBuilder, VectorsConfigBuilder,
     },
 };
-use rig::{agent::Agent, completion::Prompt, providers::ollama};
-use rig::{client::CompletionClient, providers::ollama::CompletionModel};
+use rig::{agent::Agent, completion::Prompt, extractor::Extractor};
+use rig::{
+    client::{
+        builder::{BoxAgentBuilder, DynClientBuilder},
+        completion::CompletionModelHandle,
+    },
+    extractor::ExtractorBuilder,
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 pub mod config;
@@ -23,6 +31,30 @@ pub mod workers;
 pub use config::*;
 pub use snippet::*;
 pub use traverse::*;
+
+const EXTRACTOR_PREAMBLE: &str = indoc! {"
+    The provided text is a summary of a code snippet.
+    Your task is to generate 3 synthetic queries that a developer
+    might use to search for this specific entry within a larger codebase.
+    Avoid relying on keyword search terms and favor concepts and meaning.
+    Focus on the specific purpose of the snippet.
+    Avoid general queries about design patterns, language idioms, error handling, etc.
+    Each query should be unique, and together,
+    they should span the semantic breadth of the summary.
+    Ensure that each query has enough semantic context to distinguish it from
+    general questions that can be answered without this specific snippet.
+"};
+
+const SUMMARY_PREAMBLE: &str = indoc! {r##"
+    You are a helpful software engineer mentoring a new team-mate.
+    Without preamble or introduction, summarize provided code snippets, in a few sentences.
+    Focus on its purpose, but also explain what it does and how it works in general terms without
+    referring to specific literal values.
+
+    Be sure to mention key types and functions used, if applicable.
+    But do not dwell on basic concepts or things that are obvious like what it means for something to be public.
+    Keep your explanation in paragraph format, using complete sentences.
+"##};
 
 pub struct Progressor {
     pub multi: MultiProgress,
@@ -65,41 +97,11 @@ pub enum SnippetProgress {
         progress: Option<ProgressBar>,
     },
 }
-pub fn get_ollama_agent(config: &Config) -> Agent<CompletionModel> {
-    let preamble = config.persona.as_deref().unwrap_or(indoc! {r##"
-            You are a helpful software engineer mentoring a new team-mate.
-            Without preamble or introduction, summarize provided code snippets, in a few sentences.
-            Focus on its purpose, but also explain what it does and how it works in general terms without
-            referring to specific literal values.
-
-            Be sure to mention key types and functions used, if applicable.
-            But do not dwell on basic concepts or things that are obvious like what it means for something to be public.
-            Keep your explanation in paragraph format, using complete sentences.
-        ""##});
-    ollama::Client::from_url(config.llm_base_url.as_ref().unwrap())
-        .agent(config.llm_model.as_ref().unwrap())
-        .max_tokens(1024)
-        // TODO: Really need to work on taming the LLM's verbiage
-        .preamble(preamble)
-        .build()
-}
 
 // Allows both static dispatch via generics or dynamic via boxing
 #[async_trait]
 pub trait DynAgent: Send + Sync {
     async fn prompt(&self, body: &str) -> Result<String>;
-}
-
-#[async_trait(?Send)]
-pub trait DynChecker: Send + Sync {
-    async fn call(&self) -> Result<()>;
-}
-
-#[async_trait(?Send)]
-impl<T: AsyncFn() -> Result<()> + Send + Sync> DynChecker for T {
-    async fn call(&self) -> Result<()> {
-        (self)().await
-    }
 }
 
 #[async_trait]
@@ -117,77 +119,93 @@ impl<T: DynAgent + ?Sized> DynAgent for Box<T> {
     }
 }
 
-// // Probably unnecessary given the flexibility of boxed closure style
-//
-// #[async_trait(?Send)]
-// pub trait AgentFactory {
-//     fn build(&self) -> Box<dyn DynAgent>;
-//
-//     async fn check(&self) -> Result<()>;
-// }
-//
-// #[async_trait(?Send)]
-// impl AgentFactory for Box<dyn AgentFactory> {
-//     fn build(&self) -> Box<dyn DynAgent> {
-//         (**self).build()
-//     }
-//
-//     async fn check(&self) -> Result<()> {
-//         (**self).check().await
-//     }
-// }
-//
-// #[async_trait(?Send)]
-// impl AgentFactory for BoxAgentFactory {
-//     fn build(&self) -> Box<dyn DynAgent> {
-//         (self.builder)()
-//     }
-//
-//     async fn check(&self) -> Result<()> {
-//         self.checker.call().await
-//     }
-// }
+#[async_trait]
+pub trait DynExtractor<T: JsonSchema + for<'a> Deserialize<'a> + Send + Sync>: Send + Sync {
+    async fn extract(&self, body: &str) -> Result<T>;
+}
 
+#[async_trait]
+impl<M: rig::completion::CompletionModel, T: JsonSchema + for<'a> Deserialize<'a> + Send + Sync>
+    DynExtractor<T> for Extractor<M, T>
+{
+    async fn extract(&self, body: &str) -> Result<T> {
+        Ok(Extractor::extract(self, body).await?)
+    }
+}
+
+// The part that supports dynamic dispatch via unsized trait objects.
+#[async_trait]
+impl<T: JsonSchema + for<'a> Deserialize<'a> + Send + Sync, A: DynExtractor<T> + ?Sized>
+    DynExtractor<T> for Box<A>
+{
+    async fn extract(&self, body: &str) -> Result<T> {
+        (**self).extract(body).await
+    }
+}
+
+#[async_trait(?Send)]
+pub trait DynChecker: Send + Sync {
+    async fn call(&self) -> Result<()>;
+}
+
+#[async_trait(?Send)]
+impl<T: AsyncFn() -> Result<()> + Send + Sync> DynChecker for T {
+    async fn call(&self) -> Result<()> {
+        (self)().await
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct AgentFactory {
-    /// Creates an agent instance based on config info supplied during factory initialization.
-    builder: Box<dyn Fn() -> Box<dyn DynAgent>>,
+    provider: String,
 
-    /// Checks that the provider information supplied when creating the factory is valid.
-    /// i.e. may check API urls, tokens, model names, etc using remote calls.
-    checker: Box<dyn DynChecker>,
+    model: String,
+
+    summary_preamble: Option<String>,
+
+    synth_preamble: Option<String>,
 }
 
+// TODO: upgrade to rig >= 0.19 and impl VerifyClient
 impl AgentFactory {
-    pub fn new(builder: Box<dyn Fn() -> Box<dyn DynAgent>>, checker: Box<dyn DynChecker>) -> Self {
-        Self { builder, checker }
-    }
-
-    pub fn build(&self) -> Box<dyn DynAgent> {
-        (self.builder)()
-    }
-
-    pub async fn check(&self) -> Result<()> {
-        self.checker.call().await
-    }
-}
-
-pub fn get_agent_factory(config: &Config) -> Result<AgentFactory> {
-    let checker = {
-        let base_url = config.llm_base_url.clone().unwrap();
-        async move || {
-            reqwest::get(&base_url)
-                .await
-                .context("Unable to connect to LLM provider")?
-                .text()
-                .await?;
-            Ok(())
+    pub fn new(config: &Config) -> Self {
+        Self {
+            provider: config.llm_provider.clone().unwrap(),
+            model: config.llm_model.clone().unwrap(),
+            summary_preamble: config.persona.clone(),
+            // TODO: config extractor PREAMBLE
+            ..Default::default()
         }
-    };
+    }
 
-    let config = config.clone();
-    let builder = move || Box::new(get_ollama_agent(&config)) as Box<dyn DynAgent>;
+    pub fn model(&self) -> anyhow::Result<CompletionModelHandle<'static>> {
+        let client = DynClientBuilder::new();
+        let model = client.completion(&self.provider, &self.model)?;
 
-    Ok(AgentFactory::new(Box::new(builder), Box::new(checker)))
+        Ok(CompletionModelHandle {
+            inner: Arc::from(model),
+        })
+    }
+
+    pub fn agent(&self) -> anyhow::Result<BoxAgentBuilder<'static>> {
+        Ok(DynClientBuilder::new().agent(&self.provider, &self.model)?)
+    }
+
+    pub fn summarizer(&self) -> anyhow::Result<BoxAgentBuilder<'static>> {
+        Ok(self
+            .agent()?
+            .preamble(self.summary_preamble.as_deref().unwrap_or(SUMMARY_PREAMBLE)))
+    }
+
+    pub fn extractor<T>(&self) -> Result<ExtractorBuilder<T, CompletionModelHandle<'static>>>
+    where
+        T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
+    {
+        let builder = ExtractorBuilder::new(self.model()?)
+            .preamble(self.synth_preamble.as_deref().unwrap_or(EXTRACTOR_PREAMBLE));
+
+        Ok(builder)
+    }
 }
 
 pub async fn init_collection(client: &Qdrant, collection: &str, dims: u64) -> Result<()> {

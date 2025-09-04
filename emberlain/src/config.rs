@@ -58,7 +58,7 @@ pub struct Config {
 
     /// Base URL of the language model server
     #[arg(long)]
-    pub llm_base_url: Option<String>,
+    pub llm_provider: Option<String>,
 
     /// Name of the language model for summarizing code snippets
     #[arg(long)]
@@ -105,8 +105,8 @@ impl Default for Config {
             summary_workers: Some(1),
             synthetics: Default::default(),
             persona: None,
+            llm_provider: Some("ollama".into()),
             llm_model: Some("devstral:latest".into()),
-            llm_base_url: Some("http://localhost:11434".into()),
             collection: Some("myproject".into()),
             qdrant_url: Some("http://localhost:6334".into()),
             embed_model: Default::default(),

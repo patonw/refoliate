@@ -1,55 +1,33 @@
 use flume::{Receiver, Sender};
 use log::info;
-use rig::{client::CompletionClient as _, providers};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
 use crate::CodeSnippet;
-use crate::DynAgent;
+use crate::DynExtractor;
 use crate::SnippetProgress;
 
-const LLM_MODEL: &str = "my-qwen3-coder:30b";
-const LLM_BASE_URL: &str = "http://10.10.10.100:11434";
-
-const PREAMBLE: &str = "\
-        The provided text is a summary of a code snippet.\n\
-        Your task is to generate 3 synthetic queries that a developer \
-        might use to search for this specific entry within a larger codebase.\n\
-        Avoid relying on keyword search terms and favor concepts and meaning. \n\
-        Focus on the specific purpose of the snippet. \n\
-        Avoid general queries about design patterns, language idioms, error handling, etc. \n\
-        Each query should be unique, and together, \
-        they should span the semantic breadth of the summary. \n\
-        Ensure that each query has enough semantic context to distinguish it from \
-        general questions that can be answered without this specific snippet.\
-    ";
-
 #[derive(Deserialize, Serialize, JsonSchema, PartialEq, Debug, Clone)]
-struct Synthetics {
+pub struct Synthetics {
     queries: Vec<String>,
 }
 
 #[derive(TypedBuilder)]
-pub struct SynthWorker<A: DynAgent> {
-    #[allow(dead_code)]
-    agent: A,
+pub struct SynthWorker<T: DynExtractor<Synthetics>> {
+    extractor: T,
 
     #[builder(default)]
     enabled: bool,
 }
 
-impl<A: DynAgent> SynthWorker<A> {
+impl<T: DynExtractor<Synthetics>> SynthWorker<T> {
     pub async fn run(
         &self,
         receiver: Receiver<SnippetProgress>,
         sender: Sender<SnippetProgress>,
     ) -> anyhow::Result<()> {
-        let llm = providers::ollama::Client::from_url(LLM_BASE_URL);
-        let extractor = llm
-            .extractor::<Synthetics>(LLM_MODEL)
-            .preamble(PREAMBLE)
-            .build();
+        let extractor = &self.extractor;
 
         while let Ok(msg) = receiver.recv_async().await {
             match msg {
