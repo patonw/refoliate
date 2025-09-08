@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use cached_path::cached_path;
-use ignore::types::TypesBuilder;
+use ignore::types::{Types, TypesBuilder};
 use ignore::{Walk, WalkBuilder};
 use itertools::Itertools;
 use log::{debug, warn};
@@ -224,7 +224,7 @@ impl SourceWalker {
         Ok(())
     }
 
-    pub fn iter_repo(&self, root: impl AsRef<Path>) -> Result<Walk> {
+    pub fn get_types(&self) -> Result<Types> {
         let mut types_builder = TypesBuilder::new();
         for (lang, spec) in self.languages.deref() {
             for ext in &spec.extensions {
@@ -234,6 +234,11 @@ impl SourceWalker {
             types_builder.select(lang);
         }
         let types = types_builder.build()?;
+        Ok(types)
+    }
+
+    pub fn iter_repo(&self, root: impl AsRef<Path>) -> Result<Walk> {
+        let types = self.get_types()?;
 
         Ok(WalkBuilder::new(root).types(types).build())
     }

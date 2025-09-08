@@ -5,3 +5,4 @@ pub mod progress;
 pub mod prune;
 pub mod summarize;
 pub mod synthesize;
+pub mod pathfinder;

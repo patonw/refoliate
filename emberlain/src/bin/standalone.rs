@@ -1,5 +1,6 @@
 use anyhow::Result;
 use emberlain::template::Templater;
+use emberlain::workers::pathfinder::Pathfinder;
 use emberlain::workers::progress::ProgressWorker;
 use emberlain::workers::prune::PruningWorker;
 use emberlain::workers::synthesize::SynthWorker;
@@ -125,6 +126,8 @@ async fn main() -> Result<()> {
     let qdrant_client = Qdrant::from_url(CONFIG.qdrant_url.as_ref().unwrap()).build()?;
     init_collection(&qdrant_client, COLLECTION_NAME.as_str(), *EMBED_DIMS as u64).await?;
 
+    let pathfinder = Pathfinder::builder().types(src_walker.get_types()?).build();
+
     let mut extractor = ExtractingWorker::builder().walker(src_walker).build();
 
     let deduper = DedupWorker::builder()
@@ -181,7 +184,7 @@ async fn main() -> Result<()> {
 
     // Preliminary book keeping
     let total_count = if CONFIG.progress.filter(|t| *t).is_some() {
-        extractor
+        pathfinder
             .count_files(CONFIG.target_path.as_ref().unwrap())
             .await
             .ok()
@@ -195,7 +198,8 @@ async fn main() -> Result<()> {
         bars.file_progress.set_length(count as u64);
     }
 
-    // hmm, is capacity per receiver, sender or total?
+    let local = task::LocalSet::new();
+    let (path_tx, path_rx) = flume::bounded(4);
     let (snippet_tx, snippet_rx) = flume::bounded(4);
     let (dedup_tx, dedup_rx) = flume::bounded(4);
     let (summary_tx, summary_rx) = flume::bounded(4);
@@ -203,21 +207,35 @@ async fn main() -> Result<()> {
     let (embed_tx, embed_rx) = flume::bounded(4);
 
     // Launch all workers
-
-    // Only tree-sitter needs to be run locally
-    let local = task::LocalSet::new();
-    {
+    let path_task = {
         let progressor = progressor.clone();
-        local.spawn_local(async move {
-            if let Err(err) = extractor
-                .run(progressor, snippet_tx, repo_root, target_path)
+        let repo_root = repo_root.clone();
+        let target_path = target_path.clone();
+
+        spawn(async move {
+            if let Err(err) = pathfinder
+                .run(progressor, path_tx, repo_root, target_path)
                 .await
             {
                 log::error!("{err:?}");
                 exit(1);
             }
+        })
+    };
+
+    // Only tree-sitter needs to be run locally
+    {
+        let path_rx = path_rx.clone();
+        let repo_root = repo_root.clone();
+        local.spawn_local(async move {
+            if let Err(err) = extractor.run(path_rx, snippet_tx, repo_root).await {
+                log::error!("{err:?}");
+                exit(1);
+            }
         });
     }
+
+    drop(path_rx);
 
     let dedup_task = spawn(async {
         if let Err(err) = deduper.run(snippet_rx, dedup_tx).await {
@@ -270,8 +288,11 @@ async fn main() -> Result<()> {
         }
     });
 
+    // This await needs to be first for anything to proceed
     local.await;
     debug!("Extraction workers done");
+
+    debug!("Pathfinder done: {:?}", path_task.await.err());
 
     let dedup_errs = dedup_task.await.err();
     debug!("Dedup workers done: {dedup_errs:?}");

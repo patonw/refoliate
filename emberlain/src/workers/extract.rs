@@ -1,16 +1,15 @@
 use anyhow::{Context, Result};
+use flume::Receiver;
 use flume::Sender;
-use ignore::{DirEntry, Walk};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use itertools::Itertools;
 use itertools::MinMaxResult;
-use log::info;
 use log::warn;
-use std::{path::Path, sync::Arc};
+use std::path::Path;
 use typed_builder::TypedBuilder;
 
 use crate::{
-    CodeSnippet, Progressor, SnippetProgress, SourceWalker,
+    CodeSnippet, SnippetProgress, SourceWalker,
     parse::{cb::FileMatchArgs, process_node},
 };
 
@@ -19,81 +18,81 @@ pub struct ExtractingWorker {
     walker: SourceWalker,
 }
 
-// Can't inline with iter_repo due to borrowing restrictions
-fn filter_repo(walk: Walk) -> impl Iterator<Item = DirEntry> {
-    walk.filter_map(|entry| entry.ok())
-        .filter(|entry| !entry.path().is_dir())
-}
-
 impl ExtractingWorker {
-    pub async fn count_files(&mut self, target_path: impl AsRef<Path>) -> Result<usize> {
-        let walk = filter_repo(self.walker.iter_repo(target_path.as_ref())?);
-        Ok(walk.count())
-    }
-
     pub async fn run(
         &mut self,
-        progressor: Arc<Option<Progressor>>,
+        receiver: Receiver<SnippetProgress>,
         sender: Sender<SnippetProgress>,
         repo_root: impl AsRef<Path>,
-        target_path: impl AsRef<Path>,
     ) -> Result<()> {
-        let walk = filter_repo(self.walker.iter_repo(target_path.as_ref())?);
-        for file_path in walk {
-            if let Err(err) = extract_file(
-                &progressor,
-                &sender,
-                &mut self.walker,
-                repo_root.as_ref(),
-                file_path,
-            )
-            .await
-            {
-                warn!("{err:?}");
+        while let Ok(msg) = receiver.recv_async().await {
+            match msg {
+                SnippetProgress::StartOfFile {
+                    file_path,
+                    progressor,
+                    progress,
+                } => {
+                    sender
+                        .send_async(SnippetProgress::StartOfFile {
+                            file_path: file_path.clone(),
+                            progressor: progressor.clone(),
+                            progress: progress.clone(),
+                        })
+                        .await?;
+
+                    if let Err(err) = extract_file(
+                        &sender,
+                        &mut self.walker,
+                        repo_root.as_ref(),
+                        file_path,
+                        progress.clone(),
+                    )
+                    .await
+                    {
+                        warn!("{err:?}");
+                    }
+                    sender
+                        .send_async(SnippetProgress::EndOfFile {
+                            progressor: progressor.clone(),
+                            progress: progress.clone(),
+                        })
+                        .await?;
+                }
+                _ => {
+                    log::warn!("Unexpected message received by ExtractingWorker");
+                    sender.send_async(msg).await?;
+                }
             }
         }
-
-        info!("Done walking {:?}", target_path.as_ref());
 
         Ok::<_, anyhow::Error>(())
     }
 }
 
 async fn extract_file(
-    progressor: &Arc<Option<Progressor>>,
     snippet_tx: &Sender<SnippetProgress>,
     src_walk: &mut SourceWalker,
     root_path: impl AsRef<Path>,
-    file_path: ignore::DirEntry,
+    file_path: impl AsRef<Path>,
+    progress: Option<ProgressBar>,
 ) -> Result<()> {
+    let abs_path = root_path.as_ref().join(file_path.as_ref());
+
+    // TODO: handle missing files
+
     let (source_code, tree, query) = src_walk
-        .parse_file(file_path.path())
+        .parse_file(abs_path)
         .await
         .context("Failed to parse file")?;
 
     // dbg!(tree.root_node().to_sexp());
 
-    let file_path = file_path.path();
-    let file_path = file_path.strip_prefix(root_path).unwrap_or(file_path);
-
     let entry = FileMatchArgs {
-        file_path,
+        file_path: file_path.as_ref(),
         source: source_code.as_slice(),
         tree: &tree,
         query: query.as_ref(),
     };
-
-    let snip_tx = snippet_tx.clone();
-    let progress = make_file_progress(progressor, &entry);
-    let prog = progress.clone();
-
-    snippet_tx
-        .send_async(SnippetProgress::StartOfFile {
-            file_path: file_path.to_path_buf(),
-            progressor: progressor.clone(),
-            progress: progress.clone(),
-        })
-        .await?;
 
     process_node(
         entry.tree.root_node(),
@@ -101,7 +100,6 @@ async fn extract_file(
         entry.query,
         vec![],
         &async move |node_match| {
-            let progress = prog.clone();
             let n = node_match.query_match;
             let p = entry.file_path;
             let q = entry.query;
@@ -183,42 +181,11 @@ async fn extract_file(
                     clean: true,
                 };
 
-                snip_tx.send_async(msg).await.unwrap();
+                snippet_tx.send_async(msg).await.unwrap();
             }
         },
     )
     .await;
 
-    snippet_tx
-        .send_async(SnippetProgress::EndOfFile {
-            progressor: progressor.clone(),
-            progress: progress.clone(),
-        })
-        .await?;
-
-    // Why is this different from the tests?
-
     Ok(())
-}
-
-fn make_file_progress(
-    progressor: &Arc<Option<Progressor>>,
-    entry: &FileMatchArgs<'_>,
-) -> Option<ProgressBar> {
-    if let Some(bar) = progressor.as_ref() {
-        let byte_progress = bar
-            .multi
-            .insert_from_back(1, ProgressBar::new(entry.source.len() as u64));
-
-        byte_progress.set_style(
-            ProgressStyle::with_template(
-                "[{elapsed_precise}] {bar:30.cyan/blue} {decimal_bytes:>10}/{decimal_total_bytes:10} {wide_msg}",
-            )
-            .unwrap(),
-        );
-        byte_progress.set_message(format!("{:?}", entry.file_path));
-        Some(byte_progress)
-    } else {
-        None
-    }
 }
