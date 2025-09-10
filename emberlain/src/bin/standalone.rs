@@ -126,7 +126,11 @@ async fn main() -> Result<()> {
     let qdrant_client = Qdrant::from_url(CONFIG.qdrant_url.as_ref().unwrap()).build()?;
     init_collection(&qdrant_client, COLLECTION_NAME.as_str(), *EMBED_DIMS as u64).await?;
 
-    let pathfinder = Pathfinder::builder().types(src_walker.get_types()?).build();
+    let pathfinder = Pathfinder::builder()
+        .types(src_walker.get_types()?)
+        .qdrant(qdrant_client.clone())
+        .collection(CONFIG.collection.clone().unwrap())
+        .build();
 
     let mut extractor = ExtractingWorker::builder().walker(src_walker).build();
 

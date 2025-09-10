@@ -83,6 +83,9 @@ impl Default for Progressor {
 }
 
 pub enum SnippetProgress {
+    MissingFile {
+        file_path: PathBuf,
+    },
     StartOfFile {
         file_path: PathBuf,
         progressor: Arc<Option<Progressor>>,

@@ -58,6 +58,9 @@ impl ExtractingWorker {
                         })
                         .await?;
                 }
+                msg @ SnippetProgress::MissingFile { .. } => {
+                    sender.send_async(msg).await?;
+                }
                 _ => {
                     log::warn!("Unexpected message received by ExtractingWorker");
                     sender.send_async(msg).await?;

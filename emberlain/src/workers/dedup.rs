@@ -33,6 +33,26 @@ impl<'a> DedupWorker<'a> {
     ) -> anyhow::Result<Self> {
         while let Ok(msg) = receiver.recv_async().await {
             let msg = match msg {
+                SnippetProgress::MissingFile { file_path } => {
+                    log::debug!("File {file_path:?} is missing. Marking for removal.");
+                    self.qdrant
+                        .set_payload(
+                            SetPayloadPointsBuilder::new(
+                                &self.collection,
+                                Payload::try_from(json!({
+                                    "__removed": Utc::now().to_rfc3339(),
+                                }))
+                                .unwrap(),
+                            )
+                            .points_selector(Filter::must([
+                                Condition::is_empty("__removed"),
+                                Condition::matches("path", file_path.display().to_string()),
+                            ])),
+                        )
+                        .await?;
+
+                    continue;
+                }
                 SnippetProgress::StartOfFile {
                     file_path,
                     progressor,

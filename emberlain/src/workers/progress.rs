@@ -58,6 +58,7 @@ impl ProgressWorker {
                     let count = snippet.body.len();
                     progress.as_ref().inspect(|p| p.inc(count as u64));
                 }
+                _ => {}
             }
         }
         Ok(self)
