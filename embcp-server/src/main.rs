@@ -1,6 +1,6 @@
 use anyhow::Context as _;
 use cached::proc_macro::cached;
-use fastembed::TextEmbedding;
+use fastembed::{RerankInitOptions, RerankerModel, TextEmbedding, TextRerank};
 use itertools::Itertools;
 use qdrant_client::{
     Qdrant,
@@ -38,6 +38,15 @@ struct SearchRequest {
 
     /// Number of results to return (default: 5)
     limit: Option<u64>,
+
+    /// Additional number of points to fetch. If non zero, will rerank results. (default: 5)
+    overfetch: Option<u64>,
+
+    /// Exclude points that have these attribute, delimited by ";" (default: "test; tokio::test")
+    exclude: Option<String>,
+
+    /// Payload keys to return, delimited by ";" (default: "interface; class; name; path; summary")
+    fields: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -51,6 +60,8 @@ pub struct QdrantTool {
     tool_router: ToolRouter<QdrantTool>,
 
     embedder: Arc<Mutex<TextEmbedding>>,
+
+    reranker: Arc<Mutex<TextRerank>>,
 
     client: Qdrant,
 
@@ -82,12 +93,19 @@ async fn get_vectors_config(client: &Qdrant, collection: String) -> anyhow::Resu
 
 #[tool_router]
 impl QdrantTool {
-    #[tool(description = "Search document by semantic query")]
-    async fn search(
+    #[tool]
+    /// Query repository for code snippets by semantic similarity
+    async fn search_repo(
         &self,
         params: Parameters<SearchRequest>,
     ) -> Result<Json<SearchResponse>, String> {
-        let Parameters(SearchRequest { text, limit }) = params;
+        let Parameters(SearchRequest {
+            text,
+            limit,
+            overfetch,
+            exclude,
+            fields,
+        }) = params;
 
         let vec_config = get_vectors_config(&self.client, self.collection.clone())
             .await
@@ -95,19 +113,40 @@ impl QdrantTool {
         let mut embeds = {
             let mut embedder = self.embedder.lock().map_err(|e| e.to_string())?;
             embedder
-                .embed(vec![text], None)
+                .embed(vec![text.clone()], None)
                 .map_err(|e| e.to_string())?
         };
 
         let embedding = embeds.remove(0);
 
+        let num_results = limit.unwrap_or(5);
+        let num_fetch = num_results + overfetch.unwrap_or(5);
+
+        let excluded_attrs = exclude
+            .as_deref()
+            .unwrap_or("test; tokio::test")
+            .split(";")
+            .map(|s| s.trim().to_string())
+            .collect_vec();
+
+        let point_filter = Filter {
+            must: vec![Condition::is_empty("__removed")],
+            must_not: vec![Condition::matches("attributes", excluded_attrs)],
+            ..Default::default()
+        };
+
+        let field_selector = fields
+            .as_deref()
+            .unwrap_or("interface; class; name; path; summary")
+            .split(";")
+            .map(|s| s.trim().to_string())
+            .collect_vec();
+
         let query = QueryPointsBuilder::new(self.collection.as_str())
             .query(embedding.clone())
-            .with_payload(SelectorOptions::Exclude(
-                vec!["id".to_string(), "hash".to_string()].into(),
-            ))
-            .filter(Filter::must([Condition::is_empty("__removed")]))
-            .limit(limit.unwrap_or(5));
+            .with_payload(SelectorOptions::Include(field_selector.into()))
+            .filter(point_filter)
+            .limit(num_fetch);
 
         let query = if let VecConfig::ParamsMap(_params) = vec_config {
             // TODO: pull alias from config
@@ -118,13 +157,41 @@ impl QdrantTool {
         };
 
         let resp = self.client.query(query).await.unwrap();
-        let data = resp
+
+        let texts = resp
+            .result
+            .iter()
+            .map(|p| {
+                p.payload
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&"".to_string())
+                    .to_string()
+            })
+            .collect_vec();
+
+        let mut data = resp
             .result
             .iter()
             .filter_map(|point| {
                 serde_json::to_value(json!({"payload": &point.payload, "score": point.score})).ok()
             })
             .collect_vec();
+
+        let data = if num_fetch > num_results {
+            let mut reranker = self.reranker.lock().map_err(|e| e.to_string())?;
+            let results = reranker
+                .rerank(text, texts, true, None)
+                .map_err(|e| e.to_string())?;
+
+            results
+                .iter()
+                .map(|r| data[r.index].take())
+                .take(num_results as usize)
+                .collect_vec()
+        } else {
+            data
+        };
 
         Ok(Json(SearchResponse { data }))
     }
@@ -135,7 +202,10 @@ impl QdrantTool {
 impl rmcp::ServerHandler for QdrantTool {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
-            instructions: Some("A simple calculator".into()),
+            instructions: Some(format!(
+                "Semantic database of code fragments for the **{}** project",
+                &self.collection
+            )),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
@@ -165,10 +235,17 @@ async fn main() -> anyhow::Result<()> {
             .with_cache_dir(config.fastembed_cache.as_ref().unwrap().into()),
     )?;
 
+    let reranker = TextRerank::try_new(
+        RerankInitOptions::new(RerankerModel::JINARerankerV1TurboEn)
+            .with_show_download_progress(true)
+            .with_cache_dir(config.fastembed_cache.as_ref().unwrap().into()),
+    )?;
+
     let client = Qdrant::from_url(config.qdrant_url.as_ref().unwrap()).build()?;
 
     let handler = QdrantTool::builder()
         .embedder(Arc::new(Mutex::new(embedder)))
+        .reranker(Arc::new(Mutex::new(reranker)))
         .client(client)
         .collection(config.collection.clone().unwrap())
         .build();
