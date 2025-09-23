@@ -2,9 +2,9 @@
 path = "upstream/qdrant-client"
 
 [workspace]
-resolver = "3"
-members = ["emberlain", "embasee", "embcp-server"]
+members = ["embasee", "embcp-server", "emberlain", "nursery"]
 exclude = ["upstream"]
+resolver = "3"
 
 [workspace.dependencies]
 fastembed = "5.5"
