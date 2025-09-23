@@ -2,7 +2,7 @@
 path = "upstream/qdrant-client"
 
 [workspace]
-members = ["embasee", "embcp-server", "emberlain", "nursery"]
+members = ["embasee", "embcp-server", "emberlain", "hatchery"]
 exclude = ["upstream"]
 resolver = "3"
 
