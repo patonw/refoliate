@@ -1,6 +1,6 @@
 [workspace]
 members = ["embcp-server", "emberlain"]
-exclude = ["embasee", "upstream"]
+exclude = ["aerie", "embasee", "upstream"]
 resolver = "3"
 
 [workspace.dependencies]

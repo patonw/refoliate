@@ -28,6 +28,7 @@ in
 {
   inherit pkgs libraries rust-toolchain;
 
+  aerie = callPackage ./aerie {};
   embasee = callPackage ./embasee {};
   embcp-server = callPackage ./embcp-server {};
 }
