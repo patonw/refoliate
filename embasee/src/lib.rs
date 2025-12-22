@@ -1,7 +1,6 @@
-use anyhow::Context as _;
-use cached::proc_macro::cached;
 use polars::prelude::*;
-use qdrant_client::{Qdrant, qdrant::vectors_config::Config as VecConfig};
+
+pub use caching::*;
 
 #[macro_export]
 macro_rules! pydict {
@@ -26,7 +25,7 @@ macro_rules! pyimport {
     ($mod_name:expr, $sym_name:expr) => {{
         use pyo3::prelude::*;
 
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             PyModule::import(py, $mod_name)
                 .and_then(|m| m.getattr($sym_name))
                 .map(|m| m.unbind())
@@ -106,26 +105,36 @@ where
     builder.finish().into_series()
 }
 
-// TODO: common lib
-#[cached(
-    convert = r##"{ format!("{collection}") }"##,
-    key = "String",
-    time = 10,
-    result = true
-)]
-pub async fn get_vectors_config(client: &Qdrant, collection: &str) -> anyhow::Result<VecConfig> {
-    let meta = client.collection_info(collection).await?;
-    let vectors_config: VecConfig = meta
-        .result
-        .context("No result")?
-        .config
-        .context("No config")?
-        .params
-        .context("No params")?
-        .vectors_config
-        .context("No vectors config")?
-        .config
-        .context("No config")?;
+pub mod caching {
+    use anyhow::Context as _;
+    use cached::proc_macro::cached;
+    use qdrant_client::{Qdrant, qdrant::vectors_config::Config as VecConfig};
+    use std::time::Duration;
 
-    Ok(vectors_config)
+    // TODO: common lib
+    #[cached(
+        convert = r##"{ format!("{collection}") }"##,
+        key = "String",
+        time = 10,
+        result = true
+    )]
+    pub async fn get_vectors_config(
+        client: &Qdrant,
+        collection: &str,
+    ) -> anyhow::Result<VecConfig> {
+        let meta = client.collection_info(collection).await?;
+        let vectors_config: VecConfig = meta
+            .result
+            .context("No result")?
+            .config
+            .context("No config")?
+            .params
+            .context("No params")?
+            .vectors_config
+            .context("No vectors config")?
+            .config
+            .context("No config")?;
+
+        Ok(vectors_config)
+    }
 }

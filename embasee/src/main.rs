@@ -23,12 +23,17 @@ use tokio::runtime::Runtime;
 
 use eframe::egui;
 use egui::{
-    Align, CollapsingHeader, Color32, Frame, Layout, RichText, ScrollArea, Sense, Style, UiBuilder,
-    Visuals,
+    Align, CollapsingHeader, Color32, Frame, KeyboardShortcut, Layout, RichText, ScrollArea, Sense,
+    Style, UiBuilder, Visuals,
 };
 use egui_plot::{MarkerShape, Plot, PlotResponse, Points};
 
 use embasee::{get_vectors_config, optzip, pydict, pyimport};
+
+const SHORTCUT_QUIT: KeyboardShortcut = KeyboardShortcut {
+    modifiers: egui::Modifiers::CTRL,
+    logical_key: egui::Key::Q,
+};
 
 // TODO: set fastembed cache using XDG cache dir
 
@@ -78,7 +83,7 @@ fn main() -> anyhow::Result<()> {
 
     // Necessary to keep an instance in memory to prevent SIGSEGV, even if it's not used.
     // Guessing UMAP implementation is using ref counts to keep C data in memory.
-    let _umap = Python::with_gil(|py| {
+    let _umap = Python::attach(|py| {
         let umap = UMAP.bind(py).call(
             (),
             Some(&pydict! { py;
@@ -458,7 +463,7 @@ impl MyEguiApp {
                     let x_u = if let Ok(umap_guard) = umap_lock.lock()
                         && let Some(umap) = umap_guard.as_ref()
                     {
-                        Python::with_gil(|py| {
+                        Python::attach(|py| {
                             let umap = umap.bind(py);
                             let x_u = umap.call_method1("transform", (vec![&embedding],)).unwrap();
                             // TODO extract result to query_point
@@ -824,17 +829,17 @@ impl MyEguiApp {
             let refresh_point = {
                 let mut app_state = self.app_state.lock().unwrap();
                 let hovered_id = hovered_plot_item
-                    .and_then(|h| (app_state.hash_to_uuid.get(&h)))
+                    .and_then(|h| app_state.hash_to_uuid.get(&h))
                     .cloned();
 
                 hovered_id
                     .as_ref()
-                    .and_then(|uuid| (app_state.hover_point.replace(uuid.clone())));
+                    .and_then(|uuid| app_state.hover_point.replace(uuid.clone()));
 
                 if ui.input(|i| i.pointer.primary_clicked()) {
                     let old_id = hovered_id
                         .as_ref()
-                        .and_then(|uuid| (app_state.select_point.replace(uuid.clone())));
+                        .and_then(|uuid| app_state.select_point.replace(uuid.clone()));
 
                     if old_id == app_state.select_point {
                         app_state.select_point = None;
@@ -1004,22 +1009,19 @@ impl MyEguiApp {
 
 impl eframe::App for MyEguiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input_mut(|i| i.consume_shortcut(&SHORTCUT_QUIT)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::TopBottomPanel::top("Header").show_inside(ui, |ui| {
                 self.render_navbar(ui);
             });
 
             egui::SidePanel::left("Explorer")
-                // .resizable(false)
                 .default_width(300.0)
                 .show_inside(ui, |ui| {
                     self.render_explorer(ui).unwrap();
-
-                    //     });
-                    // egui::SidePanel::right("Inspector")
-                    //     // .resizable(false)
-                    //     .default_width(300.0)
-                    //     .show_inside(ui, |ui| {
 
                     ui.separator();
 
@@ -1126,7 +1128,7 @@ fn project_embeddings(
     df: DataFrame,
     anchors: Option<DataFrame>,
 ) -> DataFrame {
-    let x_umap = Python::with_gil(|py| {
+    let x_umap = Python::attach(|py| {
         let mut umap_guard = umap.lock().unwrap();
 
         let umap = match umap_guard.as_ref() {

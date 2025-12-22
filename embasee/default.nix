@@ -2,6 +2,8 @@
   sources,
   pkgs,
   fenix,
+  gitignoreSource,
+  nixgl,
   rust-toolchain,
   naersk,
 }:
@@ -29,14 +31,12 @@ let
     zlib
     openssl
     onnxruntime
+    wayland
   ];
-in
-{
-  inherit libraries mypython;
-  bin = naersk.buildPackage {
+  nixGL = nixgl.auto.nixGLDefault; # Necessary for running glutin on non-Nixos distros
+  embasee = naersk.buildPackage {
     name = "embasee";
-    src = ../.;
-    cargoBuildOptions = opts: opts ++ [ "--package embasee" ];
+    src = gitignoreSource ./.;
 
     nativeBuildInputs = with pkgs; [
       pkg-config
@@ -55,7 +55,35 @@ in
       fi
     '';
 
+    LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath libraries}";
     ORT_ENV_SYSTEM_LIB_LOCATION = "${pkgs.onnxruntime}/lib/libonnxruntime.so";
+  };
+in
+rec {
+  inherit libraries mypython;
+  bin = pkgs.writeShellApplication {
+    name = "embasee";
+    runtimeInputs = [nixGL];
+    text = ''
+      export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath libraries}
+      nixGL ${embasee}/bin/embasee "$@"
+    '';
+  };
+
+  desktop = pkgs.makeDesktopItem {
+    # Desktop launcher only
+    name = "Embasee";
+    desktopName = "Embasee Embedding Explorer";
+    exec = "${nixGL}/bin/nixGL ${embasee}/bin/embasee";
+  };
+
+  app = pkgs.buildEnv {
+    # all launchers
+    name = "embasee";
+    paths = [
+      bin
+      desktop
+    ];
   };
 }
 

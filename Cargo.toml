@@ -1,9 +1,6 @@
-[patch.crates-io.qdrant-client]
-path = "upstream/qdrant-client"
-
 [workspace]
-members = ["embasee", "embcp-server", "emberlain"]
-exclude = ["upstream"]
+members = ["embcp-server", "emberlain"]
+exclude = ["embasee", "upstream"]
 resolver = "3"
 
 [workspace.dependencies]
@@ -17,3 +14,6 @@ features = []
 [workspace.dependencies.rig-core]
 version = "0.24.0"
 features = ["derive"]
+
+[patch.crates-io]
+qdrant-client = { git = "https://github.com/patonw/qdrant-client", branch = "testgen-v1.15.0" }
