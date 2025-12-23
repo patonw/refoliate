@@ -1,12 +1,19 @@
+[patch.crates-io.qdrant-client]
+path = "upstream/qdrant-client"
+
 [workspace]
 resolver = "3"
 members = ["emberlain", "embasee", "embcp-server"]
 exclude = ["upstream"]
 
 [workspace.dependencies]
-qdrant-client = { version = "1.15.0", features = [] }
+fastembed = "5.5"
+schemars = "1.0.4"
 
-[patch.crates-io]
-# Using a submodule instead of a git url...
-# Naersk doesn't seem to handle pulling remote patches like it does with explicit git dependencies
-qdrant-client = { path = "upstream/qdrant-client" }
+[workspace.dependencies.qdrant-client]
+version = "1.15.0"
+features = []
+
+[workspace.dependencies.rig-core]
+version = "0.24.0"
+features = ["derive"]

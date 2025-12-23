@@ -80,7 +80,7 @@ impl CodeSnippet {
         Ok(Uuid::new_v8(hash[..16].try_into()?))
     }
 
-    pub fn body(&self) -> Cow<String> {
+    pub fn body(&self) -> Cow<'_, String> {
         if self.rendered.is_empty() {
             Cow::Borrowed(&self.body)
         } else {

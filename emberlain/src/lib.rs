@@ -197,7 +197,7 @@ impl AgentFactory {
             .preamble(self.summary_preamble.as_deref().unwrap_or(SUMMARY_PREAMBLE)))
     }
 
-    pub fn extractor<T>(&self) -> Result<ExtractorBuilder<T, CompletionModelHandle<'static>>>
+    pub fn extractor<T>(&self) -> Result<ExtractorBuilder<CompletionModelHandle<'static>, T>>
     where
         T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
     {

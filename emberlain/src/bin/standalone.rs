@@ -9,7 +9,7 @@ use indicatif_log_bridge::LogWrapper;
 use log::debug;
 use qdrant_client::Qdrant;
 use std::process::exit;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::task::JoinSet;
 use tokio::{spawn, task};
 use tracing_log::LogTracer;
@@ -148,11 +148,13 @@ async fn main() -> Result<()> {
         })
         .collect::<Vec<_>>();
 
-    let embed_model = Arc::new(TextEmbedding::try_new(
+    let embed_model = TextEmbedding::try_new(
         fastembed::InitOptions::new(EMBED_MODEL.clone())
             .with_show_download_progress(true)
             .with_cache_dir(CONFIG.fastembed_cache.as_ref().unwrap().into()),
-    )?);
+    )?;
+
+    let embed_model = Arc::new(Mutex::new(embed_model));
 
     let synth_worker = SynthWorker::builder()
         .extractor(agent_factory.extractor()?.build())
@@ -160,7 +162,7 @@ async fn main() -> Result<()> {
         .build();
 
     let embedder = EmbeddingWorker::builder()
-        .embedding(embed_model.clone())
+        .embedding(embed_model)
         .qdrant(qdrant_client.clone())
         .collection(CONFIG.collection.clone().unwrap())
         .build();

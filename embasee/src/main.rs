@@ -261,7 +261,7 @@ impl MyEguiApp {
                         });
 
                         let embeddings =
-                            model.and_then(|m| m.embed(ANCHOR_QUERIES.clone(), None).ok());
+                            model.and_then(|mut m| m.embed(ANCHOR_QUERIES.clone(), None).ok());
 
                         embeddings.unwrap_or_default()
                     }
@@ -420,7 +420,7 @@ impl MyEguiApp {
                 .spawn_blocking({
                     let task_count = task_count.clone();
                     move || {
-                        let model = TextEmbedding::try_new(
+                        let mut model = TextEmbedding::try_new(
                             fastembed::InitOptions::new(model_id)
                                 .with_show_download_progress(true)
                                 .with_cache_dir(FASTEMBED_CACHE_DIR.as_str().into()),

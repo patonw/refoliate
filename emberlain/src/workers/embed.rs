@@ -5,14 +5,17 @@ use qdrant_client::{
     Payload, Qdrant,
     qdrant::{PointStruct, UpsertPointsBuilder, Vector},
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 use typed_builder::TypedBuilder;
 
 use crate::SnippetProgress;
 
 #[derive(TypedBuilder)]
 pub struct EmbeddingWorker {
-    embedding: Arc<TextEmbedding>,
+    embedding: Arc<Mutex<TextEmbedding>>,
     qdrant: Qdrant,
     collection: String,
 }
@@ -37,7 +40,11 @@ impl EmbeddingWorker {
                     let mut texts = vec![snippet.summary.as_str()];
                     texts.extend(snippet.queries.iter().map(|s| s.as_str()));
 
-                    let embeddings = self.embedding.embed(texts, None)?;
+                    let embeddings = {
+                        let mut embedder = self.embedding.lock().unwrap();
+                        embedder.embed(texts, None)?
+                    };
+
                     let embedding = embeddings[0].clone();
 
                     let id = snippet.uuid()?.to_string();

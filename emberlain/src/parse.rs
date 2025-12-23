@@ -39,7 +39,7 @@ pub struct Breadloaf<'a> {
 }
 
 impl<'a> Breadloaf<'a> {
-    pub fn capture_nodes(&self, crumb: &'a Breadcrumb, capture_name: &str) -> Vec<Node> {
+    pub fn capture_nodes(&self, crumb: &'a Breadcrumb, capture_name: &str) -> Vec<Node<'_>> {
         if let Some(idx) = self.query.capture_index_for_name(capture_name) {
             crumb
                 .captures

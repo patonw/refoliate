@@ -11,7 +11,7 @@ use qdrant_client::{
 };
 use rmcp::{
     Json, ServiceExt,
-    handler::server::{router::tool::ToolRouter, tool::Parameters},
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::*,
     schemars::JsonSchema,
     serde::{Deserialize, Serialize},
@@ -20,7 +20,10 @@ use rmcp::{
     transport::stdio,
 };
 use serde_with::skip_serializing_none;
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use typed_builder::TypedBuilder;
 
 use crate::config::{Config, get_embed_info};
@@ -47,7 +50,7 @@ pub struct QdrantTool {
     #[builder(default=QdrantTool::tool_router())]
     tool_router: ToolRouter<QdrantTool>,
 
-    embedder: TextEmbedding,
+    embedder: Arc<Mutex<TextEmbedding>>,
 
     client: Qdrant,
 
@@ -89,10 +92,12 @@ impl QdrantTool {
         let vec_config = get_vectors_config(&self.client, self.collection.clone())
             .await
             .map_err(|e| e.to_string())?;
-        let mut embeds = self
-            .embedder
-            .embed(vec![text], None)
-            .map_err(|e| e.to_string())?;
+        let mut embeds = {
+            let mut embedder = self.embedder.lock().map_err(|e| e.to_string())?;
+            embedder
+                .embed(vec![text], None)
+                .map_err(|e| e.to_string())?
+        };
 
         let embedding = embeds.remove(0);
 
@@ -163,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
     let client = Qdrant::from_url(config.qdrant_url.as_ref().unwrap()).build()?;
 
     let handler = QdrantTool::builder()
-        .embedder(embedder)
+        .embedder(Arc::new(Mutex::new(embedder)))
         .client(client)
         .collection(config.collection.clone().unwrap())
         .build();
