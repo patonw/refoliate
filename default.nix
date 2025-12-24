@@ -2,38 +2,29 @@
   sources ? import ./nix/sources.nix,
   pkgs ? import sources.nixpkgs {},
   fenix ? import sources.fenix {},
+  gitignore ? import sources."gitignore.nix" {},
+  nixgl ? import sources.nixGL {},
+  rust-toolchain ? fenix.combine [
+    fenix.complete.toolchain
+    fenix.targets.wasm32-unknown-unknown.latest.rust-std
+  ],
+  naersk ? pkgs.callPackage sources.naersk {
+    cargo = rust-toolchain;
+    rustc = rust-toolchain;
+  },
 }:
 let
-  PLAYWRIGHT_ENV = ''
-      export PLAYWRIGHT_BROWSERS_PATH=${pkgs.playwright-driver.browsers}
-      export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true
-  '';
   libraries = with pkgs; [
     openssl
     wasmtime
+    stdenv.cc.cc.lib
   ];
-  rustifer = fenix.combine [
-    # https://jordankaye.dev/posts/rust-wasm-nix/ but latest instead of stable
-    fenix.complete.toolchain
-    fenix.targets.wasm32-unknown-unknown.latest.rust-std
-  ];
+
+  callPackage = pkgs.lib.callPackageWith {
+    inherit sources pkgs fenix rust-toolchain naersk gitignore nixgl;
+    inherit (gitignore) gitignoreSource;
+  };
 in
 {
-  shell = pkgs.mkShell {
-    LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath libraries}";
-    packages = with pkgs; [
-      niv
-      cmake
-      ninja
-      cargo-generate
-      moon
-      nodejs_22
-      pkg-config
-      rustifer
-      uv
-    ] ++ libraries;
-    shellHook = ''
-      ${PLAYWRIGHT_ENV}
-    '';
-  };
+  inherit pkgs libraries rust-toolchain;
 }

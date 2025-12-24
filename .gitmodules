@@ -1,0 +1,4 @@
+[submodule "upstream/qdrant-client"]
+	path = upstream/qdrant-client
+	url = https://github.com/patonw/qdrant-client
+	branch = testgen-v1.15.0
