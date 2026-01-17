@@ -22,14 +22,15 @@ let
     zlib
     openssl
     wayland
+    dbus
   ];
   nixGL = nixgl.auto.nixGLDefault; # Necessary for running glutin on non-Nixos distros
-  aerie = naersk.buildPackage {
+  build-aerie = { features ? [] } : naersk.buildPackage {
     # Command line launchers
     name = "aerie-bin";
     gitSubmodules = true;
     src = gitignoreSource ./.;
-    cargoBuildOptions = opts: opts ++ [ "--package aerie" ];
+    cargoBuildOptions = opts: opts ++ [ "--package aerie" ] ++ (if features == [] then [] else [ "-F" (pkgs.lib.strings.join "," features)]);
 
     nativeBuildInputs = with pkgs; [
       pkg-config
@@ -53,6 +54,8 @@ let
     #   fi
     # '';
   };
+  aerie = build-aerie {};
+  migrate-aerie = build-aerie { features = ["migration"]; };
 in
 rec {
   inherit libraries;
@@ -72,6 +75,15 @@ rec {
     text = ''
       export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath libraries}
       simple-runner "$@"
+    '';
+  };
+
+  migration = pkgs.writeShellApplication {
+    name = "aerie-migration";
+    runtimeInputs = [migrate-aerie];
+    text = ''
+      export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath libraries}
+      migrate-workflow "$@"
     '';
   };
 

@@ -12,13 +12,16 @@ use crate::{
     ChatContent,
     ui::{resizable_frame, shortcuts::squelch},
     utils::EVec2,
-    workflow::WorkflowError,
+    workflow::{FlexNode, WorkflowError},
 };
 
 use super::{DynNode, EditContext, RunContext, UiNode, Value, ValueKind};
 
 #[derive(Debug, Clone, Default, Hash, PartialEq, Eq, Deserialize, Serialize)]
 pub struct GraftHistory {}
+
+#[typetag::serde]
+impl FlexNode for GraftHistory {}
 
 impl DynNode for GraftHistory {
     fn inputs(&self) -> usize {
@@ -94,6 +97,9 @@ impl UiNode for GraftHistory {
 pub struct MaskHistory {
     pub limit: usize,
 }
+
+#[typetag::serde]
+impl FlexNode for MaskHistory {}
 
 impl DynNode for MaskHistory {
     fn inputs(&self) -> usize {
@@ -222,6 +228,9 @@ pub struct CreateMessage {
     content: String,
     size: Option<EVec2>,
 }
+
+#[typetag::serde]
+impl FlexNode for CreateMessage {}
 
 impl DynNode for CreateMessage {
     fn in_kinds(&'_ self, _in_pin: usize) -> Cow<'_, [ValueKind]> {
@@ -380,6 +389,9 @@ pub struct ExtendHistory {
     pub count: usize,
 }
 
+#[typetag::serde]
+impl FlexNode for ExtendHistory {}
+
 impl DynNode for ExtendHistory {
     fn inputs(&self) -> usize {
         self.count + 2 // Slot for history plus empty to add new msg
@@ -456,4 +468,35 @@ impl UiNode for ExtendHistory {
 
         self.in_kinds(pin_id).first().unwrap().default_pin()
     }
+}
+
+fn history_node_menu(
+    ui: &mut egui::Ui,
+    snarl: &mut egui_snarl::Snarl<super::WorkNode>,
+    pos: egui::Pos2,
+) {
+    ui.menu_button("History", |ui| {
+        if ui.button("Create Message").clicked() {
+            snarl.insert_node(pos, CreateMessage::default().into());
+            ui.close();
+        }
+
+        if ui.button("Mask History").clicked() {
+            snarl.insert_node(pos, MaskHistory::default().into());
+            ui.close();
+        }
+
+        if ui.button("Extend History").clicked() {
+            snarl.insert_node(pos, ExtendHistory::default().into());
+            ui.close();
+        }
+
+        if ui.button("Side Chat").clicked() {
+            snarl.insert_node(pos, GraftHistory::default().into());
+            ui.close();
+        }
+    });
+}
+inventory::submit! {
+    super::GraphSubmenu("history", history_node_menu)
 }
