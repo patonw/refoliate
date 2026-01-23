@@ -97,6 +97,7 @@ rhai = { version = "1.23.6", optional = true, features = [
   "serde",
   "serde_json",
 ] }
+scopeguard = "1.2.0"
 
 [features]
 default = ["scripting"]
