@@ -24,7 +24,7 @@ let
     wayland
     dbus
   ];
-  nixGL = nixgl.auto.nixGLDefault; # Necessary for running glutin on non-Nixos distros
+  nixGL = pkgs.nixgl.auto.nixGLDefault; # Necessary for running glutin on non-Nixos distros
   build-aerie = { features ? [] } : naersk.buildPackage {
     # Command line launchers
     name = "aerie-bin";
@@ -69,6 +69,15 @@ rec {
     '';
   };
 
+  shell = pkgs.writeShellApplication {
+    name = "aerie";
+    runtimeInputs = [nixGL aerie pkgs.busybox];
+    text = ''
+      export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath libraries}
+      busybox ash
+    '';
+  };
+
   runner = pkgs.writeShellApplication {
     name = "aerie-runner";
     runtimeInputs = [aerie];
@@ -94,9 +103,10 @@ rec {
     exec = "${nixGL}/bin/nixGL ${bin}/bin/aerie";
   };
 
-  app = pkgs.buildEnv {
+  aerie-app = pkgs.buildEnv {
     # all launchers
     name = "aerie-app";
+    pname = "aerie-app";
     paths = [
       bin
       runner

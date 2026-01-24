@@ -1,5 +1,5 @@
 {
-  _workspace ? import ./. {},
+  _workspace ? import ./.,
   pkgs ? _workspace.pkgs,
   libraries ? _workspace.libraries,
   rust-toolchain ? _workspace.rust-toolchain,

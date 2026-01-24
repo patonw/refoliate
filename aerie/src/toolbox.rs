@@ -4,6 +4,7 @@ use crate::rig::{
     completion::CompletionModel,
     tool::{Tool as _, ToolSet as RigToolSet},
 };
+use anyhow::Context as _;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use cached::proc_macro::cached;
 use either::Either;
@@ -15,6 +16,7 @@ use std::{
     borrow::Cow,
     iter,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::Arc,
 };
 use tokio::process::Command;
@@ -404,10 +406,11 @@ impl ToolProvider {
                 ..
             } => {
                 let client = ()
-                    .serve(TokioChildProcess::new(Command::new(command).configure(
-                        |cmd| {
+                    .serve(
+                        TokioChildProcess::new(Command::new(command).configure(|cmd| {
                             let cmd = args.iter().fold(cmd, |cmd, arg| cmd.arg(arg));
-                            // cmd.stderr(Stdio::null());
+                            cmd.stdout(Stdio::piped());
+                            cmd.stderr(Stdio::piped());
                             if let Some(cwd) = dir {
                                 cmd.current_dir(cwd);
                             }
@@ -420,8 +423,9 @@ impl ToolProvider {
                                 tracing::trace!("Env substitution: '{v}' => '{value}");
                                 cmd.env(k, &*value);
                             }
-                        },
-                    ))?)
+                        }))
+                        .context(format!("while running {command} with {args:?}"))?,
+                    )
                     .await
                     .inspect_err(|e| {
                         tracing::error!("client error: {:?}", e);
