@@ -1,6 +1,6 @@
 [package]
 name = "aerie"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 default-run = "aerie"
 
@@ -27,6 +27,7 @@ eframe = "0.33.2"
 egui = "0.33.2"
 egui-phosphor = "0.11.0"
 egui-snarl = { version = "0.9.0", features = ["serde"] }
+# egui-snarl = { git = "https://github.com/patonw/egui-snarl", branch = "update-selection", features = ["serde"] }
 egui_commonmark = "0.22.0"
 egui_extras = { version = "0.33.2", features = ["http", "image", "syntect"] }
 egui_tiles = "0.14.0"

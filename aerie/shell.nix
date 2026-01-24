@@ -1,5 +1,5 @@
 {
-  _workspace ? import ../. {},
+  _workspace ? import ../.,
   _parent ? import ../shell.nix {},
   pkgs ? _workspace.pkgs,
   aerie ? _workspace.aerie,

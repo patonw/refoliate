@@ -230,6 +230,8 @@ impl AgentFactory {
                     toolbox.with_provider(&name, toolkit);
                 }
                 err => {
+                    let Err(e) = &err else { unreachable!() };
+                    tracing::error!("{e:?}");
                     errors.distil(err.context(format!("Could not load provider {name}")));
                     settings.update(|conf| {
                         conf.tools

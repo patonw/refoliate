@@ -16,8 +16,9 @@
   - `git clone --recurse-submodules https://github.com/patonw/refoliate`
   - `cd refoliate`
   - `git submodule update --init --recursive` (only needed for updates)
-- Install using nix-env:
-  - `nix-env --install -f . -A aerie.app`
+- Install using `nix profile`:
+  - `nix --experimental-features 'nix-command flakes' profile install --impure .#aerie.aerie-app`
+    - Flakes feature can be [permanently enabled](https://nixos.wiki/wiki/flakes#Other_Distros.2C_without_Home-Manager)
   - this takes a while the first time: must create a build environment
     - More of a lunch break than a coffee break
   - Can launch from command line or desktop environment

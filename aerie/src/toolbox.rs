@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use cached::proc_macro::cached;
 use im::OrdMap;
@@ -9,7 +10,7 @@ use rig::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{borrow::Cow, iter, sync::Arc};
+use std::{borrow::Cow, iter, process::Stdio, sync::Arc};
 use tokio::process::Command;
 
 use rmcp::{
@@ -339,10 +340,11 @@ impl ToolProvider {
                 ..
             } => {
                 let client = ()
-                    .serve(TokioChildProcess::new(Command::new(command).configure(
-                        |cmd| {
+                    .serve(
+                        TokioChildProcess::new(Command::new(command).configure(|cmd| {
                             let cmd = args.iter().fold(cmd, |cmd, arg| cmd.arg(arg));
-                            // cmd.stderr(Stdio::null());
+                            cmd.stdout(Stdio::piped());
+                            cmd.stderr(Stdio::piped());
                             if let Some(cwd) = dir {
                                 cmd.current_dir(cwd);
                             }
@@ -355,8 +357,9 @@ impl ToolProvider {
                                 tracing::trace!("Env substitution: '{v}' => '{value}");
                                 cmd.env(k, &*value);
                             }
-                        },
-                    ))?)
+                        }))
+                        .context(format!("while running {command} with {args:?}"))?,
+                    )
                     .await
                     .inspect_err(|e| {
                         tracing::error!("client error: {:?}", e);
