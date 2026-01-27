@@ -25,7 +25,11 @@ use crate::{
     AgentFactory, LogEntry, Settings, ToolSpec,
     chat::ChatSession,
     transmute::Transmuter,
-    ui::{AppEvent, ShowHelp, tiles::messages::MessageGraph, workflow::WorkflowViewer},
+    ui::{
+        AppEvent, ShowHelp,
+        tiles::messages::MessageGraph,
+        workflow::{ProgressEntry, WorkflowViewer},
+    },
     utils::{ErrorDistiller as _, ErrorList},
     workflow::{
         EditContext, PreviewData, ShadowGraph, WorkNode,
@@ -128,7 +132,7 @@ impl AppState {
                 .events(self.events.clone())
                 .build();
 
-            tracing::info!(
+            tracing::debug!(
                 "Changing view to node {:?}: {:?}",
                 &viewer.shadow.uuid,
                 &viewer.node_state
@@ -670,6 +674,32 @@ impl<W: WorkflowStore> WorkflowState<W> {
                         graph
                     }
                 });
+                true
+            }
+            ProgressBegin(id, max) => {
+                if let Some(viewer) = &mut self.viewer {
+                    viewer
+                        .progress
+                        .insert(*id, ProgressEntry(*max, Default::default()));
+                }
+
+                true
+            }
+            ProgressAdd(id, incr) => {
+                if let Some(viewer) = &mut self.viewer {
+                    let entry = viewer.progress.entry(*id).or_default();
+                    entry
+                        .1
+                        .fetch_add(*incr, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                true
+            }
+            ProgressEnd(id) => {
+                if let Some(viewer) = &mut self.viewer {
+                    viewer.progress.remove(id);
+                }
+
                 true
             }
             _ => false,
