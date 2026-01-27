@@ -348,7 +348,12 @@ impl ToolProvider {
                             }
 
                             for (k, v) in env.split("\n").filter_map(|s| s.split_once('=')) {
-                                cmd.env(k, v);
+                                let value = subst::substitute(v, &subst::Env)
+                                    .map(Cow::Owned)
+                                    .unwrap_or(Cow::Borrowed(v));
+
+                                tracing::trace!("Env substitution: '{v}' => '{value}");
+                                cmd.env(k, &*value);
                             }
                         },
                     ))?)
