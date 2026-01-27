@@ -11,9 +11,12 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use serde_yaml_ng as serde_yml;
 
-use crate::workflow::{
-    DynNode, FlexNode, ShadowGraph, UiNode, Value, ValueKind, WorkNode, WorkflowError,
-    runner::WorkflowRunner,
+use crate::{
+    ui::AppEvent,
+    workflow::{
+        DynNode, FlexNode, ShadowGraph, UiNode, Value, ValueKind, WorkNode, WorkflowError,
+        runner::WorkflowRunner,
+    },
 };
 
 // "serializing nested enums in YAML is not supported yet"
@@ -122,6 +125,8 @@ impl Subgraph {
         use Value::*;
         use rayon::prelude::*;
 
+        let graph_id = self.graph.uuid;
+
         if inputs.iter().flatten().all(|it| !it.kind().is_list()) {
             return self.exec_simple(ctx, inputs);
         }
@@ -158,6 +163,7 @@ impl Subgraph {
             .collect_vec();
 
         let num_iters = lengths[0];
+        ctx.event(AppEvent::ProgressBegin(graph_id.0, num_iters));
 
         let all_out = (0..num_iters)
             .into_par_iter()
@@ -166,7 +172,7 @@ impl Subgraph {
                 let mut exec = WorkflowRunner::builder()
                     .inputs(sliced)
                     .run_ctx(ctx.clone())
-                    .state_view(ctx.node_state.view(&self.graph.uuid).pass(i))
+                    .state_view(ctx.node_state.view(&graph_id).pass(i))
                     .build();
 
                 exec.init(&self.graph);
@@ -180,7 +186,7 @@ impl Subgraph {
 
                 loop {
                     if interrupt.load(Ordering::Relaxed) {
-                        break;
+                        Err(WorkflowError::Interrupted)?;
                     }
 
                     match exec.step(&mut target) {
@@ -193,6 +199,8 @@ impl Subgraph {
                         Err(err) => Err(WorkflowError::Subgraph(err))?,
                     }
                 }
+
+                ctx.event(AppEvent::ProgressAdd(graph_id.0, 1));
                 Ok(exec.outputs)
             })
             .try_fold(
@@ -215,12 +223,18 @@ impl Subgraph {
             );
 
         let mut results = all_out?;
+        ctx.event(AppEvent::ProgressEnd(graph_id.0));
         results.push(Value::Placeholder(ValueKind::Failure));
 
         Ok(results)
     }
 }
+
 impl DynNode for Subgraph {
+    fn uuid(&self) -> Option<uuid::Uuid> {
+        Some(self.graph.uuid.0)
+    }
+
     fn inputs(&self) -> usize {
         self.graph
             .start_node()

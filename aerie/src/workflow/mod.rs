@@ -36,7 +36,7 @@ use crate::{
     agent::AgentSpec,
     config::SeedConfig,
     transmute::Transmuter,
-    ui::AppEvents,
+    ui::{AppEvent, AppEvents},
     utils::{AtomicBuffer, ErrorList, ImmutableMapExt as _, ImmutableSetExt as _, message_text},
     workflow::{
         nodes::{Finish, Flavor, Start},
@@ -255,6 +255,9 @@ pub struct RunContext {
     pub agent_factory: AgentFactory,
 
     #[builder(default)]
+    pub events: Option<Arc<AppEvents>>,
+
+    #[builder(default)]
     pub streaming: bool,
 
     #[builder(default)]
@@ -288,6 +291,17 @@ pub struct RunContext {
 
     #[builder(default)]
     pub errors: ErrorList<anyhow::Error>,
+}
+
+impl RunContext {
+    #[inline]
+    pub fn event(&self, event: AppEvent) {
+        let Some(queue) = &self.events else {
+            return;
+        };
+
+        queue.insert(event);
+    }
 }
 
 #[derive(TypedBuilder)]
@@ -402,6 +416,8 @@ impl AsRef<Uuid> for GraphId {
         &self.0
     }
 }
+
+pub type GraphNodeId = (GraphId, NodeId);
 
 /// The shadow graph is incrementally updated when edits are made through the viewer.
 /// Each change creates a new generation. The underlying collections use structure sharing
@@ -838,6 +854,10 @@ impl ShadowGraph<WorkNode> {
 pub trait DynNode {
     fn priority(&self) -> usize {
         5000
+    }
+
+    fn uuid(&self) -> Option<Uuid> {
+        None
     }
 
     fn value(&self, out_pin: usize) -> Value {
