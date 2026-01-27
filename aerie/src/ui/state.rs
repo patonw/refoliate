@@ -5,6 +5,7 @@ use egui_commonmark::*;
 use egui_tiles::SimplificationOptions;
 use itertools::Itertools;
 use rmcp::model::Tool;
+use serde_yaml_ng as serde_yml;
 use std::{
     borrow::Cow,
     collections::VecDeque,
