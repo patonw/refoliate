@@ -4,7 +4,7 @@ use aerie::{
     AgentFactory, ChatSession, Settings,
     utils::message_text,
     workflow::{
-        RootContext, RunContext, ShadowGraph, WorkNode,
+        RootContext, RunContext, Workflow,
         runner::WorkflowRunner,
         store::{WorkflowStore as _, WorkflowStoreDir},
         write_value,
@@ -161,7 +161,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut prompt = args.input.as_ref().cloned().unwrap_or_default();
     let workflow_path = args.workflow.as_path();
-    let mut shadow: ShadowGraph<WorkNode> = if workflow_path.is_file() {
+    let mut shadow: Workflow = if workflow_path.is_file() {
         let reader = OpenOptions::new().read(true).open(workflow_path)?;
         serde_yml::from_reader(reader)?
     } else if let Some(store) = &mut workflow_store {
@@ -174,6 +174,7 @@ fn main() -> anyhow::Result<()> {
         let run_ctx = RunContext::builder()
             .runtime(rt.handle().clone())
             .agent_factory(agent_factory.clone())
+            .metadata(shadow.metadata.clone())
             .history(session.history.clone())
             .seed(settings.seed.clone())
             .build();
@@ -194,7 +195,7 @@ fn main() -> anyhow::Result<()> {
 
         let inputs = RootContext::builder()
             .history(session.history.clone())
-            .graph(shadow.clone())
+            .workflow(shadow.clone())
             .user_prompt(prompt.clone())
             .model(settings.llm_model.clone())
             .temperature(settings.temperature)
@@ -206,8 +207,8 @@ fn main() -> anyhow::Result<()> {
             .run_ctx(run_ctx)
             .build();
 
-        exec.init(&shadow);
-        let mut snarl = Snarl::try_from(shadow.clone())?;
+        exec.init(&shadow.graph);
+        let mut snarl = Snarl::try_from(shadow.graph.as_ref().clone())?;
 
         let result = loop {
             match exec.step(&mut snarl) {

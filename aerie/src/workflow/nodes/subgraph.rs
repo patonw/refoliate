@@ -76,6 +76,8 @@ impl Subgraph {
     ) -> Result<Vec<Value>, WorkflowError> {
         // TODO: customize context for subgraph
         // What to do about outputs channel?
+        let mut ctx = ctx.clone();
+        ctx.is_subgraph = true;
         let mut exec = WorkflowRunner::builder()
             .inputs(inputs)
             .run_ctx(ctx.clone())
@@ -86,7 +88,7 @@ impl Subgraph {
         let interrupt = ctx.interrupt.clone();
 
         let mut target = egui_snarl::Snarl::try_from(self.graph.clone())?;
-        tracing::info!("About to execute subgraph");
+        tracing::debug!("About to execute subgraph {:?}", self.graph.uuid);
 
         loop {
             if interrupt.load(Ordering::Relaxed) {
@@ -125,10 +127,13 @@ impl Subgraph {
         use Value::*;
         use rayon::prelude::*;
 
+        let mut ctx = ctx.clone();
+        ctx.is_subgraph = true;
+
         let graph_id = self.graph.uuid;
 
         if inputs.iter().flatten().all(|it| !it.kind().is_list()) {
-            return self.exec_simple(ctx, inputs);
+            return self.exec_simple(&ctx, inputs);
         }
 
         let lengths = inputs
@@ -182,7 +187,7 @@ impl Subgraph {
                 let interrupt = ctx.interrupt.clone();
 
                 let mut target = egui_snarl::Snarl::try_from(self.graph.clone())?;
-                tracing::info!("About to execute subgraph");
+                tracing::debug!("About to execute subgraph {:?}", self.graph.uuid);
 
                 loop {
                     if interrupt.load(Ordering::Relaxed) {

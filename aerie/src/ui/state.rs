@@ -32,7 +32,7 @@ use crate::{
     },
     utils::{ErrorDistiller as _, ErrorList},
     workflow::{
-        EditContext, PreviewData, ShadowGraph, WorkNode,
+        EditContext, PreviewData, ShadowGraph, WorkNode, Workflow,
         runner::{NodeStateMap, WorkflowRun},
         store::{WorkflowStore, WorkflowStoreDir},
     },
@@ -118,6 +118,7 @@ impl AppState {
                 .toolbox(self.agent_factory.toolbox.clone())
                 .events(self.events.clone())
                 .current_graph(shadow.uuid)
+                .metadata(self.workflows.shadow.metadata.clone())
                 .parent_id(stack.parent_id())
                 .flavor(stack.flavor())
                 .errors(self.errors.clone())
@@ -250,6 +251,14 @@ impl egui_tiles::Behavior<Pane> for AppState {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MetaEdit {
+    #[default]
+    Description,
+    Schema,
+    Chain,
+}
+
 /// Portion of the UI state dealing with workflows.
 pub struct WorkflowState<W: WorkflowStore> {
     pub view_stack: ViewStack,
@@ -259,7 +268,7 @@ pub struct WorkflowState<W: WorkflowStore> {
     pub running: Arc<AtomicBool>,
     pub interrupt: Arc<AtomicBool>,
     pub editing: String,
-    pub meta_edit: usize,
+    pub meta_edit: MetaEdit,
     pub renaming: Option<String>,
     pub modtime: SystemTime,
     pub switch_count: usize,
@@ -268,17 +277,17 @@ pub struct WorkflowState<W: WorkflowStore> {
     pub store: W,
 
     /// The version of the current shadow graph saved to disk
-    pub baseline: ShadowGraph<WorkNode>,
+    pub baseline: Workflow,
 
     /// The shadow graph actively being edited
-    pub shadow: ShadowGraph<WorkNode>,
+    pub shadow: Workflow,
 
     /// Snapshot of graph runner's state
     pub node_state: NodeStateMap,
 
     /// Undo/redo support
-    pub undo_stack: im::OrdMap<String, VecDeque<(SystemTime, ShadowGraph<WorkNode>)>>,
-    pub redo_stack: im::OrdMap<String, VecDeque<(SystemTime, ShadowGraph<WorkNode>)>>,
+    pub undo_stack: im::OrdMap<String, VecDeque<(SystemTime, Workflow)>>,
+    pub redo_stack: im::OrdMap<String, VecDeque<(SystemTime, Workflow)>>,
 
     pub previews: PreviewData,
     pub outputs: im::Vector<WorkflowRun>,
@@ -290,7 +299,7 @@ impl<W: WorkflowStore> WorkflowState<W> {
             .filter(|n| store.exists(n))
             .unwrap_or("basic".to_string());
 
-        let baseline: ShadowGraph<WorkNode> = store.get(edit_workflow.as_ref()).unwrap_or_default();
+        let baseline = store.get(edit_workflow.as_ref()).unwrap_or_default();
 
         let view_stack = ViewStack::from_root(baseline.clone());
 
@@ -301,7 +310,7 @@ impl<W: WorkflowStore> WorkflowState<W> {
             running: Arc::new(AtomicBool::new(false)),
             interrupt: Arc::new(AtomicBool::new(false)),
             editing: edit_workflow.clone(),
-            meta_edit: 0,
+            meta_edit: Default::default(),
             renaming: None,
             store,
             baseline: baseline.clone(),
@@ -409,7 +418,7 @@ impl<W: WorkflowStore> WorkflowState<W> {
     }
 
     pub fn cast_shadow(&mut self, shadow: ShadowGraph<WorkNode>) {
-        if self.frozen || self.shadow.fast_eq(&shadow) {
+        if self.frozen || self.shadow.graph.fast_eq(&shadow) {
             return;
         }
 
@@ -460,7 +469,10 @@ impl<W: WorkflowStore> WorkflowState<W> {
 
         self.redo_stack.remove(&self.editing);
 
-        self.shadow = shadow;
+        self.shadow = Workflow {
+            graph: Arc::new(shadow),
+            metadata: self.shadow.metadata.clone(),
+        };
         self.modtime = SystemTime::now();
         tracing::trace!("Updating shadow. stack {}", undo_stack.len());
     }
@@ -544,7 +556,7 @@ impl<W: WorkflowStore> WorkflowState<W> {
             .truncate(true)
             .open(path)?;
 
-        serde_yml::to_writer(writer, &self.shadow)?;
+        serde_yml::to_writer(writer, &self.shadow.repair())?;
         Ok(())
     }
 
@@ -567,7 +579,7 @@ impl<W: WorkflowStore> WorkflowState<W> {
         };
 
         let reader = OpenOptions::new().read(true).open(path)?;
-        let data: ShadowGraph<WorkNode> = serde_yml::from_reader(reader)?;
+        let data: Workflow = serde_yml::from_reader(reader)?;
 
         self.store.save(&name, data)?;
         // self.store.save()?; // maybe don't?

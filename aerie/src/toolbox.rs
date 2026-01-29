@@ -503,6 +503,7 @@ impl Toolbox {
             self.providers
                 .load()
                 .keys()
+                .filter(|p| p.as_str() != provider)
                 .map(|p| format!("{p}/*"))
                 .collect()
         } else {

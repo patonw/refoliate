@@ -288,7 +288,7 @@ where
     All,
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolSelector(pub im::OrdSet<String>);
 
 impl ToolSelector {
@@ -356,10 +356,4 @@ impl ToolSelector {
 #[cached(result = true)]
 pub fn tool_glob(pattern: String) -> Result<Pattern, PatternError> {
     Pattern::new(&pattern)
-}
-
-impl Default for ToolSelector {
-    fn default() -> Self {
-        Self(im::ordset!["*/*".into()])
-    }
 }
