@@ -9,13 +9,11 @@ pub mod workflow;
 
 use egui_snarl::{InPinId, NodeId, OutPinId};
 pub use state::AppState;
+use uuid::Uuid;
 
 use crate::{
     utils::PriorityQueue,
-    workflow::{
-        AnyPin, GraphId,
-        nodes::{MIN_HEIGHT, MIN_WIDTH},
-    },
+    workflow::{AnyPin, GraphId},
 };
 
 pub enum Pane {
@@ -58,6 +56,10 @@ pub enum AppEvent {
     Freeze(Option<bool>),
     Undo,
     Redo,
+
+    ProgressBegin(Uuid, usize),
+    ProgressAdd(Uuid, usize),
+    ProgressEnd(Uuid),
 }
 
 impl AppEvent {
@@ -186,8 +188,6 @@ pub fn resizable_frame_opt(
 ) {
     let default_size = default_size.unwrap_or(egui::vec2(300.0, 150.0));
     egui::Resize::default()
-        .min_width(MIN_WIDTH)
-        .min_height(MIN_HEIGHT)
         .default_size(size.map(egui::Vec2::from).unwrap_or(default_size))
         .with_stroke(false)
         .show(ui, |ui| {

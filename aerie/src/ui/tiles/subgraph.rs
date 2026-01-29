@@ -22,8 +22,9 @@ impl super::AppState {
             .workflows
             .running
             .load(std::sync::atomic::Ordering::Relaxed);
+        let busy = self.task_count.load(Ordering::Relaxed) > 0;
 
-        if !running && ui.ctx().input_mut(|i| i.consume_shortcut(&SHORTCUT_RUN)) {
+        if !busy && !running && ui.ctx().input_mut(|i| i.consume_shortcut(&SHORTCUT_RUN)) {
             self.events.insert(AppEvent::UserRunWorkflow);
         }
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -43,18 +44,20 @@ impl super::AppState {
                 .id(viewer.view_id)
                 .style(get_snarl_style());
 
-            widget.show(&mut snarl, viewer, ui);
+            let pointee = widget.show(&mut snarl, viewer, ui).contains_pointer();
 
             // Unfortunately, there's no event for node movement so we have to
             // iterate through the whole collection to find moved nodes.
             viewer.cast_positions(&snarl);
 
-            let mut shortcuts = ShortcutHandler::builder()
-                .snarl(&mut snarl)
-                .viewer(viewer)
-                .build();
+            if pointee {
+                let mut shortcuts = ShortcutHandler::builder()
+                    .snarl(&mut snarl)
+                    .viewer(viewer)
+                    .build();
 
-            shortcuts.viewer_shortcuts(ui, widget);
+                shortcuts.viewer_shortcuts(ui, widget);
+            }
 
             let shadow = viewer.shadow.clone();
             self.workflows
@@ -85,6 +88,8 @@ impl super::AppState {
             .workflows
             .running
             .load(std::sync::atomic::Ordering::Relaxed);
+
+        let busy = self.task_count.load(Ordering::Relaxed) > 0;
 
         ui.set_max_width(150.0);
         ui.vertical_centered_justified(|ui| {
@@ -179,7 +184,7 @@ impl super::AppState {
                             self.workflows.interrupt.store(true, Ordering::Relaxed);
                         }
                     });
-                } else if ui.add(play_button()).clicked() {
+                } else if ui.add_enabled(!busy, play_button()).clicked() {
                     self.events.insert(AppEvent::UserRunWorkflow);
                 }
             });

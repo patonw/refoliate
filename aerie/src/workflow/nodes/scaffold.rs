@@ -229,21 +229,43 @@ impl UiNode for Start {
         if ctx.parent_id.is_some() {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                 ui.menu_button("+new", |ui| {
-                    let kinds = [
-                        ValueKind::Text,
-                        ValueKind::Number,
-                        ValueKind::Integer,
-                        ValueKind::Json,
-                        ValueKind::Agent,
-                        ValueKind::Tools,
-                        ValueKind::Chat,
-                        ValueKind::Message,
-                    ];
+                    let kinds = if let Some(flavor) = ctx.flavor
+                        && flavor.is_simple()
+                    {
+                        &[
+                            ValueKind::Text,
+                            ValueKind::TextList,
+                            ValueKind::Number,
+                            ValueKind::FloatList,
+                            ValueKind::Integer,
+                            ValueKind::IntList,
+                            ValueKind::Json,
+                            ValueKind::Agent,
+                            ValueKind::Tools,
+                            ValueKind::Chat,
+                            ValueKind::Message,
+                            ValueKind::MsgList,
+                        ][..]
+                    } else {
+                        &[
+                            ValueKind::Text,
+                            ValueKind::Number,
+                            ValueKind::Integer,
+                            ValueKind::Json,
+                            ValueKind::Agent,
+                            ValueKind::Tools,
+                            ValueKind::Chat,
+                            ValueKind::Message,
+                        ][..]
+                    };
                     for kind in kinds {
-                        let label = kind.to_string().to_lowercase();
+                        let mut label = kind.to_string().to_lowercase();
+                        if kind.is_list() {
+                            label = format!("[{label}]");
+                        }
                         if ui.button(&label).clicked() {
                             self.fields = self.fields.clone();
-                            self.fields.push_back((label, kind));
+                            self.fields.push_back((label, *kind));
                         }
                     }
                 });
@@ -439,18 +461,27 @@ impl UiNode for Finish {
     fn show_footer(&mut self, ui: &mut egui::Ui, ctx: &EditContext) {
         if ctx.parent_id.is_some() {
             ui.menu_button("+new", |ui| {
+                // TODO: implement flattening in subgraph
                 let kinds = [
                     ValueKind::Text,
+                    ValueKind::TextList,
                     ValueKind::Number,
+                    ValueKind::FloatList,
                     ValueKind::Integer,
+                    ValueKind::IntList,
                     ValueKind::Json,
                     ValueKind::Agent,
                     ValueKind::Tools,
                     ValueKind::Chat,
                     ValueKind::Message,
+                    ValueKind::MsgList,
                 ];
+
                 for kind in kinds {
-                    let label = kind.to_string().to_lowercase();
+                    let mut label = kind.to_string().to_lowercase();
+                    if kind.is_list() {
+                        label = format!("[{label}]");
+                    }
                     if ui.button(&label).clicked() {
                         self.fields = self.fields.clone();
                         self.fields.push_back((label, kind));
@@ -1185,5 +1216,93 @@ impl UiNode for Demote {
     fn show_body(&mut self, ui: &mut egui::Ui, _ctx: &EditContext) {
         ui.add(egui::Slider::new(&mut self.priority, 0..=10_000).text("P"))
             .on_hover_text("priority");
+    }
+}
+
+#[derive(Debug, Clone, Default, Hash, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GateNode {
+    kind: ValueKind,
+}
+
+#[typetag::serde]
+impl FlexNode for GateNode {}
+
+impl DynNode for GateNode {
+    fn inputs(&self) -> usize {
+        2
+    }
+
+    fn out_kind(&self, _out_pin: usize) -> ValueKind {
+        self.kind
+    }
+
+    fn connect(&mut self, in_pin: usize, kind: ValueKind, ctx: &EditContext) -> Result<(), String> {
+        dbg!((&in_pin, kind));
+        if in_pin == 1 {
+            if self.kind != kind {
+                ctx.reset_out_pin(OutPinId {
+                    node: ctx.current_node,
+                    output: 0,
+                });
+            }
+
+            self.kind = kind;
+        }
+        Ok(())
+    }
+
+    fn execute(
+        &mut self,
+        _ctx: &RunContext,
+        _node_id: egui_snarl::NodeId,
+        inputs: Vec<Option<Value>>,
+    ) -> Result<Vec<Value>, WorkflowError> {
+        let value = inputs
+            .get(1)
+            .and_then(|v| v.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        Ok(vec![value])
+    }
+}
+
+impl UiNode for GateNode {
+    fn title(&self) -> &str {
+        "Gate"
+    }
+
+    fn tooltip(&self) -> &str {
+        "Delays propagation of data until the control wire is ready."
+    }
+
+    fn show_input(
+        &mut self,
+        ui: &mut egui::Ui,
+        _ctx: &EditContext,
+        pin_id: usize,
+        _remote: Option<Value>,
+    ) -> egui_snarl::ui::PinInfo {
+        match pin_id {
+            0 => {
+                ui.label("control");
+                ValueKind::Placeholder.default_pin()
+            }
+            1 => {
+                ui.label("data");
+                self.kind.default_pin()
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn show_output(
+        &mut self,
+        ui: &mut egui::Ui,
+        _ctx: &EditContext,
+        _pin_id: usize,
+    ) -> egui_snarl::ui::PinInfo {
+        ui.label("data");
+
+        self.kind.default_pin()
     }
 }

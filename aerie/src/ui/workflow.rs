@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     iter,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicUsize},
 };
 
 use anyhow::Context as _;
@@ -14,17 +14,19 @@ use egui_snarl::{
 };
 use im::vector;
 use itertools::Itertools;
+use serde_yaml_ng as serde_yml;
 use typed_builder::TypedBuilder;
+use uuid::Uuid;
 
 use crate::{
     ui::shortcuts::{ShortcutHandler, squelch},
     utils::ErrorDistiller as _,
     workflow::{
-        EditContext, GraphId, MetaNode, ShadowGraph, WorkNode,
+        EditContext, GraphId, MetaNode, ShadowGraph, WorkNode, Workflow,
         nodes::{
-            AgentNode, ChatContext, ChatNode, CommentNode, Demote, Fallback, GraphSubmenu,
-            InvokeTool, Matcher, Number, OutputNode, Panic, Preview, Select, StructuredChat,
-            Subgraph, TemplateNode, Text, Tools,
+            AgentNode, ChatContext, ChatNode, CommentNode, Demote, Fallback, Flavor, GateNode,
+            GraphSubmenu, InvokeTool, Matcher, Number, OutputNode, Panic, Preview, Select,
+            StructuredChat, Subgraph, TemplateNode, Text, Tools,
         },
         runner::{ExecState, NodeStateMap},
     },
@@ -56,15 +58,18 @@ pub struct ViewStack {
 
     pub path: im::Vector<NodeId>,
 
+    pub flavor: im::Vector<Flavor>,
+
     pub levels: im::Vector<ShadowGraph<WorkNode>>,
 }
 
 impl ViewStack {
-    pub fn new(root_graph: ShadowGraph<WorkNode>, path: impl Iterator<Item = NodeId>) -> Self {
+    pub fn new(workflow: Workflow, path: impl Iterator<Item = NodeId>) -> Self {
         let mut me = Self {
-            root_id: egui::Id::new(root_graph.uuid),
+            root_id: egui::Id::new(workflow.graph.uuid),
             path: Default::default(),
-            levels: vector![root_graph],
+            flavor: Default::default(),
+            levels: vector![workflow.graph.as_ref().clone()],
         };
 
         for id in path {
@@ -76,17 +81,17 @@ impl ViewStack {
         me
     }
 
-    pub fn from_root(root_graph: ShadowGraph<WorkNode>) -> Self {
-        Self::new(root_graph, iter::empty())
+    pub fn from_root(workflow: Workflow) -> Self {
+        Self::new(workflow, iter::empty())
     }
 
     /// Replace root graph with a different version.
     ///
     /// Attempts to preserve path, but will navigate as far as possible
     /// if subgraphs are absent.
-    pub fn switch(&mut self, root_graph: ShadowGraph<WorkNode>) {
+    pub fn switch(&mut self, workflow: Workflow) {
         let path = self.path.clone();
-        *self = Self::new(root_graph, path.into_iter());
+        *self = Self::new(workflow, path.into_iter());
     }
 
     pub fn is_empty(&self) -> bool {
@@ -133,6 +138,13 @@ impl ViewStack {
             Some((self.levels[1].uuid, self.path[0]))
         }
     }
+    pub fn flavor(&self) -> Option<Flavor> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.flavor[0])
+        }
+    }
 
     pub fn view_id(&self) -> egui::Id {
         self.root_id.with(&self.path)
@@ -140,7 +152,10 @@ impl ViewStack {
 
     pub fn exit(&mut self, levels: usize) -> anyhow::Result<()> {
         for _ in 0..levels {
-            if self.path.pop_front().is_none() || self.levels.pop_front().is_none() {
+            if self.path.pop_front().is_none()
+                || self.flavor.pop_front().is_none()
+                || self.levels.pop_front().is_none()
+            {
                 anyhow::bail!("stack is empty")
             }
         }
@@ -149,23 +164,24 @@ impl ViewStack {
     }
 
     pub fn enter(&mut self, node: NodeId) -> anyhow::Result<()> {
-        let parent = self
+        let meta = self
             .leaf()
             .nodes
             .get(&node)
             .cloned()
             .context("No such node in parent graph")?;
 
-        let graph = parent.value;
-        if !graph.is_subgraph() {
+        let container = meta.value;
+        if !container.is_subgraph() {
             anyhow::bail!("Not a subgraph");
         }
 
-        let Some(subgraph) = graph.0.downcast_ref::<Subgraph>() else {
+        let Some(subgraph) = container.0.downcast_ref::<Subgraph>() else {
             anyhow::bail!("Could not extract subgraph");
         };
 
         self.path.push_front(node);
+        self.flavor.push_front(subgraph.flavor);
         self.levels.push_front(subgraph.graph.clone());
 
         Ok(())
@@ -252,6 +268,11 @@ impl ViewStack {
     }
 }
 
+#[derive(Default, Clone, Debug)]
+pub struct ProgressEntry(pub usize, pub Arc<AtomicUsize>);
+
+pub type ProgressMap = im::OrdMap<Uuid, ProgressEntry>;
+
 #[derive(Clone, TypedBuilder)]
 pub struct WorkflowViewer {
     #[builder(default = egui::Id::new("default_viewer"))]
@@ -269,6 +290,9 @@ pub struct WorkflowViewer {
 
     #[builder(default)]
     pub node_state: NodeStateMap,
+
+    #[builder(default)]
+    pub progress: ProgressMap,
 
     #[builder(default)]
     pub running: bool,
@@ -468,68 +492,84 @@ impl SnarlViewer<WorkNode> for WorkflowViewer {
             return;
         }
 
-        egui::Sides::new().show(
-            ui,
-            |ui| {
-                if let Some(title) = snarl[node].as_ui_mut().title_mut() {
-                    if self.rename_node == Some(node) {
-                        let widget = egui::TextEdit::singleline(title).desired_width(200.0);
-                        let resp = squelch(ui.add(widget));
+        ui.vertical_centered_justified(|ui| {
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    if let Some(title) = snarl[node].as_ui_mut().title_mut() {
+                        if self.rename_node == Some(node) {
+                            let widget = egui::TextEdit::singleline(title).desired_width(200.0);
+                            let resp = squelch(ui.add(widget));
 
-                        if resp.lost_focus() {
-                            self.rename_node = None;
+                            if resp.lost_focus() {
+                                self.rename_node = None;
+                            }
+
+                            resp.request_focus();
+                        } else {
+                            let widget = egui::Label::new(snarl[node].as_ui().title()).truncate();
+                            if ui
+                                .add(widget)
+                                .interact(egui::Sense::click())
+                                .double_clicked()
+                            {
+                                self.rename_node = Some(node);
+                            }
                         }
-
-                        resp.request_focus();
                     } else {
-                        let widget = egui::Label::new(snarl[node].as_ui().title()).truncate();
+                        let title = snarl[node].as_ui().title();
+                        ui.label(title);
+                    }
+                },
+                |ui| match node_state.get(&node) {
+                    Some(ExecState::Waiting(_)) => {
+                        ui.label(RichText::new(HOURGLASS_MEDIUM).color(Color32::ORANGE))
+                            .on_hover_text("Waiting");
+                    }
+                    Some(ExecState::Ready) => {
+                        ui.label(RichText::new(PLAY_CIRCLE).color(Color32::BLUE))
+                            .on_hover_text("Ready");
+                    }
+                    Some(ExecState::Running) => {
+                        ui.add(egui::Spinner::new().color(Color32::LIGHT_GREEN))
+                            .on_hover_text("Running");
+                    }
+                    Some(ExecState::Done(_)) => {
+                        ui.label(RichText::new(CHECK_CIRCLE).color(Color32::GREEN))
+                            .on_hover_text("Done");
+                    }
+                    Some(ExecState::Disabled) => {
+                        ui.label(HAND_PALM).on_hover_text("Disabled");
+                    }
+                    Some(ExecState::Failed(err)) => {
                         if ui
-                            .add(widget)
+                            .label(RichText::new(WARNING).color(Color32::RED))
+                            .on_hover_text(format!("{err:?}"))
                             .interact(egui::Sense::click())
-                            .double_clicked()
+                            .clicked()
                         {
-                            self.rename_node = Some(node);
+                            let error = err.clone();
+                            self.edit_ctx.errors.push(error.into());
                         }
                     }
-                } else {
-                    let title = snarl[node].as_ui().title();
-                    ui.label(title);
-                }
-            },
-            |ui| match node_state.get(&node) {
-                Some(ExecState::Waiting(_)) => {
-                    ui.label(RichText::new(HOURGLASS_MEDIUM).color(Color32::ORANGE))
-                        .on_hover_text("Waiting");
-                }
-                Some(ExecState::Ready) => {
-                    ui.label(RichText::new(PLAY_CIRCLE).color(Color32::BLUE))
-                        .on_hover_text("Ready");
-                }
-                Some(ExecState::Running) => {
-                    ui.add(egui::Spinner::new().color(Color32::LIGHT_GREEN))
-                        .on_hover_text("Running");
-                }
-                Some(ExecState::Done(_)) => {
-                    ui.label(RichText::new(CHECK_CIRCLE).color(Color32::GREEN))
-                        .on_hover_text("Done");
-                }
-                Some(ExecState::Disabled) => {
-                    ui.label(HAND_PALM).on_hover_text("Disabled");
-                }
-                Some(ExecState::Failed(err)) => {
-                    if ui
-                        .label(RichText::new(WARNING).color(Color32::RED))
-                        .on_hover_text(format!("{err:?}"))
-                        .interact(egui::Sense::click())
-                        .clicked()
-                    {
-                        let error = err.clone();
-                        self.edit_ctx.errors.push(error.into());
-                    }
-                }
-                None => {}
-            },
-        );
+                    None => {}
+                },
+            );
+
+            if let Some(uuid) = snarl[node].as_dyn().uuid()
+                && let Some(progress) = self.progress.get(&uuid)
+                && progress.0 > 0
+            {
+                let ratio = progress.1.load(std::sync::atomic::Ordering::Relaxed) as f32
+                    / progress.0 as f32;
+
+                ui.add(
+                    egui::ProgressBar::new(ratio)
+                        .desired_width(ui.available_width())
+                        .desired_height(8.0),
+                );
+            }
+        });
     }
 
     fn final_node_rect(
@@ -677,6 +717,11 @@ impl SnarlViewer<WorkNode> for WorkflowViewer {
                 ui.close();
             }
 
+            if ui.button("Gate").clicked() {
+                snarl.insert_node(pos, GateNode::default().into());
+                ui.close();
+            }
+
             if ui.button("Demote").clicked() {
                 snarl.insert_node(pos, Demote::default().into());
                 ui.close();
@@ -744,11 +789,6 @@ impl SnarlViewer<WorkNode> for WorkflowViewer {
 
         for cb in menus {
             (cb.1)(ui, snarl, pos);
-        }
-
-        if ui.button("Subgraph").clicked() {
-            snarl.insert_node(pos, Subgraph::default().into());
-            ui.close();
         }
 
         if ui.button("Preview").clicked() {
@@ -828,13 +868,24 @@ impl SnarlViewer<WorkNode> for WorkflowViewer {
     ) {
         // TODO: cycle check
         if self.can_edit() {
+            self.edit_ctx.current_node = to.id.node;
+
             let remote = &snarl[from.id.node];
             let wire_kind = remote.as_dyn().out_kind(from.id.output);
-            let recipient = &snarl[to.id.node];
-            if recipient.as_dyn().connect(to.id.input, wire_kind).is_ok() {
+            let recipient = &mut snarl[to.id.node];
+            if recipient
+                .as_dyn_mut()
+                .connect(to.id.input, wire_kind, &self.edit_ctx)
+                .is_ok()
+            {
                 self.drop_inputs(to, snarl);
                 snarl.connect(from.id, to.id);
-                self.shadow = self.shadow.with_wire(from.id, to.id);
+
+                let node_id = to.id.node;
+                self.shadow = self
+                    .shadow
+                    .with_node(&node_id, snarl.get_node_info(node_id))
+                    .with_wire(from.id, to.id);
             }
         }
     }

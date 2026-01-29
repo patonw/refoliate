@@ -1,5 +1,6 @@
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use cached::proc_macro::cached;
+use im::OrdMap;
 use itertools::Itertools;
 use rig::{
     agent::AgentBuilderSimple,
@@ -8,7 +9,7 @@ use rig::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{borrow::Cow, collections::BTreeMap, iter, sync::Arc};
+use std::{borrow::Cow, iter, sync::Arc};
 use tokio::process::Command;
 
 use rmcp::{
@@ -347,7 +348,12 @@ impl ToolProvider {
                             }
 
                             for (k, v) in env.split("\n").filter_map(|s| s.split_once('=')) {
-                                cmd.env(k, v);
+                                let value = subst::substitute(v, &subst::Env)
+                                    .map(Cow::Owned)
+                                    .unwrap_or(Cow::Borrowed(v));
+
+                                tracing::trace!("Env substitution: '{v}' => '{value}");
+                                cmd.env(k, &*value);
                             }
                         },
                     ))?)
@@ -428,18 +434,20 @@ impl ToolProvider {
 /// Runtime container managing all configured tool providers
 #[derive(Default, Clone)]
 pub struct Toolbox {
-    pub providers: BTreeMap<String, ToolProvider>,
+    pub providers: Arc<ArcSwap<OrdMap<String, ToolProvider>>>,
 }
 
 impl Toolbox {
-    pub fn with_provider(&mut self, name: &str, provider: ToolProvider) -> &mut Self {
-        self.providers.insert(name.into(), provider);
+    pub fn with_provider(&self, name: &str, provider: ToolProvider) -> &Self {
+        self.providers
+            .rcu(|providers| providers.update(name.into(), provider.clone()));
         self
     }
 
     pub fn get_tools(&self, toolset: &ToolSelector) -> RigToolSet {
         let mut result = RigToolSet::default();
-        for (name, provider) in &self.providers {
+        let providers = self.providers.load();
+        for (name, provider) in providers.as_ref() {
             tracing::debug!("Adding tools for provider {name}");
             result.add_tools(provider.get_tools(name, |tool| toolset.apply(name, tool)))
         }
@@ -452,7 +460,8 @@ impl Toolbox {
         agent: AgentBuilderSimple<M>,
         pred: impl Fn(&str, &str) -> bool + Copy,
     ) -> AgentBuilderSimple<M> {
-        self.providers.iter().fold(agent, |agent, (name, chain)| {
+        let providers = self.providers.load();
+        providers.iter().fold(agent, |agent, (name, chain)| {
             chain.select_tools(agent, name, |tool| pred(name, tool))
         })
     }
@@ -466,18 +475,19 @@ impl Toolbox {
         self.select_tools(agent, |name, tool| toolset.apply(name, tool))
     }
 
-    pub fn provider_for(&self, selector: &ToolSelector, tool_name: &str) -> Option<&ToolProvider> {
+    pub fn provider_for(&self, selector: &ToolSelector, tool_name: &str) -> Option<ToolProvider> {
         self.providers
+            .load()
             .iter()
             .find(|(name, chain)| {
                 chain.contains_tool(|tool| tool == tool_name && selector.apply(name, tool))
             })
-            .map(|(_, p)| p)
+            .map(|(_, p)| p.clone())
     }
 
     pub fn timeout(&self, toolset: &ToolSelector, tool_name: &str) -> Option<u64> {
         self.provider_for(toolset, tool_name).and_then(|p| match p {
-            ToolProvider::MCP { timeout, .. } => *timeout,
+            ToolProvider::MCP { timeout, .. } => timeout,
             ToolProvider::Chainer { .. } => None,
         })
     }
@@ -490,7 +500,12 @@ impl Toolbox {
     ) -> ToolSelector {
         // First clear the selection for this item
         let selection = if selector.is_all() {
-            self.providers.keys().map(|p| format!("{p}/*")).collect()
+            self.providers
+                .load()
+                .keys()
+                .filter(|p| p.as_str() != provider)
+                .map(|p| format!("{p}/*"))
+                .collect()
         } else {
             let prefix = format!("{provider}/");
             selector
@@ -537,10 +552,12 @@ impl Toolbox {
             Ternary::All if !active => {
                 let tools = self
                     .providers
+                    .load()
                     .get(provider)
                     .iter()
                     .flat_map(|p| p.all_tool_names())
                     .filter(|n| *n != tool_name)
+                    .map(|cow| cow.into_owned())
                     .collect();
 
                 self.toggle_provider(selector, provider, Ternary::Some(tools))

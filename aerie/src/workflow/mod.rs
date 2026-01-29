@@ -10,7 +10,8 @@ use egui_snarl::{
     ui::{PinInfo, WireStyle},
 };
 use either::Either;
-use itertools::Itertools as _;
+use im::Vector;
+use itertools::Itertools;
 use jsonschema::ValidationError;
 use kinded::Kinded;
 use rig::{
@@ -19,6 +20,7 @@ use rig::{
 };
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
+use serde_yaml_ng as serde_yml;
 use std::{
     borrow::Cow,
     fmt::Debug,
@@ -34,10 +36,10 @@ use crate::{
     agent::AgentSpec,
     config::SeedConfig,
     transmute::Transmuter,
-    ui::AppEvents,
+    ui::{AppEvent, AppEvents},
     utils::{AtomicBuffer, ErrorList, ImmutableMapExt as _, ImmutableSetExt as _, message_text},
     workflow::{
-        nodes::{Finish, Start},
+        nodes::{Finish, Flavor, Start},
         runner::{ExecState, NodeStateMap},
     },
 };
@@ -53,7 +55,7 @@ pub use nodes::WorkNode;
 
 // type DynFuture<T> = Pin<Box<dyn Future<Output = T>>>;
 
-#[derive(Kinded, Debug, Clone, Serialize)]
+#[derive(Kinded, Debug, Clone, PartialEq, Serialize)]
 #[kinded(derive(Hash, Serialize, Deserialize))]
 pub enum Value {
     Placeholder(ValueKind),
@@ -61,16 +63,51 @@ pub enum Value {
     Text(Arc<String>),
     Number(E64),
     Integer(i64),
+    TextList(Vector<Arc<String>>),
+    FloatList(Vector<E64>),
+    IntList(Vector<i64>),
     Json(Arc<serde_json::Value>), // I think this is immutable?
     Agent(Arc<AgentSpec>),
     Tools(Arc<ToolSelector>),
     Chat(Arc<ChatHistory>),
     Message(Message),
+    MsgList(Vector<Arc<Message>>),
 }
 
 impl Default for Value {
     fn default() -> Self {
         Value::Placeholder(ValueKind::Placeholder)
+    }
+}
+
+impl Value {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text(Arc::new(text.into()))
+    }
+
+    pub fn text_list<T>(texts: impl IntoIterator<Item = T>) -> Self
+    where
+        T: Into<String>,
+    {
+        let texts = texts.into_iter().map(|t| Arc::new(t.into())).collect();
+        Self::TextList(texts)
+    }
+
+    pub fn float(num: impl Into<f64>) -> Self {
+        Self::Number(E64::assert(num.into()))
+    }
+
+    pub fn float_list<T: Into<f64>>(nums: impl IntoIterator<Item = T>) -> Self {
+        let values = nums.into_iter().map(|f| E64::assert(f.into()));
+        Self::FloatList(values.collect())
+    }
+
+    pub fn int_list<T: Into<i64>>(nums: impl IntoIterator<Item = T>) -> Self {
+        Self::IntList(nums.into_iter().map(|i| i.into()).collect())
+    }
+
+    pub fn msg_list<M: Into<Message>>(msgs: impl IntoIterator<Item = M>) -> Self {
+        Self::MsgList(msgs.into_iter().map(|m| Arc::new(m.into())).collect())
     }
 }
 
@@ -83,24 +120,35 @@ impl Default for ValueKind {
 
 impl ValueKind {
     pub fn color(&self) -> Color32 {
+        use ValueKind::*;
         match self {
-            ValueKind::Placeholder => Color32::LIGHT_GRAY,
-            ValueKind::Failure => Color32::RED,
-            ValueKind::Text => Color32::CYAN,
-            ValueKind::Number => Color32::from_rgb(0xbb, 0x44, 0x88),
-            ValueKind::Integer => Color32::from_rgb(0xbb, 0x77, 0x00),
-            ValueKind::Json => Color32::from_rgb(0x42, 0xbb, 0x00),
-            ValueKind::Agent => Color32::from_rgb(0x56, 0x78, 0xff),
-            ValueKind::Tools => Color32::PURPLE,
-            ValueKind::Chat => Color32::GOLD,
-            ValueKind::Message => Color32::from_rgb(0xe9, 0x74, 0x51),
+            Placeholder => Color32::LIGHT_GRAY,
+            Failure => Color32::RED,
+            Text | TextList => Color32::CYAN,
+            Number | FloatList => Color32::from_rgb(0xbb, 0x44, 0x88),
+            Integer | IntList => Color32::from_rgb(0xbb, 0x77, 0x00),
+            Json => Color32::from_rgb(0x42, 0xbb, 0x00),
+            Agent => Color32::from_rgb(0x56, 0x78, 0xff),
+            Tools => Color32::PURPLE,
+            Chat => Color32::GOLD,
+            Message | MsgList => Color32::from_rgb(0xe9, 0x74, 0x51),
         }
     }
 
     pub fn default_pin(&self) -> PinInfo {
-        PinInfo::circle()
-            .with_fill(self.color())
-            .with_wire_style(WireStyle::Bezier5)
+        let pin = if self.is_list() {
+            PinInfo::square().with_fill(self.color())
+        } else {
+            PinInfo::circle().with_fill(self.color().gamma_multiply(0.75))
+        };
+
+        // Wish we could have dashed or thick wires instead
+        pin.with_wire_style(WireStyle::Bezier5)
+    }
+
+    pub fn is_list(&self) -> bool {
+        use ValueKind::*;
+        matches!(self, TextList | FloatList | IntList | MsgList)
     }
 }
 
@@ -136,15 +184,20 @@ impl AnyPin {
 
 #[derive(Clone, TypedBuilder)]
 pub struct EditContext {
-    pub toolbox: Arc<Toolbox>,
+    pub toolbox: Toolbox,
 
     pub events: Arc<AppEvents>,
 
     pub current_graph: GraphId,
 
+    pub metadata: Arc<ShadowMeta>,
+
     /// Ids of the parent graph and subgraph container node
     #[builder(default)]
     pub parent_id: Option<(GraphId, NodeId)>,
+
+    #[builder(default)]
+    pub flavor: Option<Flavor>,
 
     #[builder(default)]
     pub previews: PreviewData,
@@ -203,6 +256,14 @@ pub struct RunContext {
 
     pub agent_factory: AgentFactory,
 
+    pub metadata: Arc<ShadowMeta>,
+
+    #[builder(default)]
+    pub events: Option<Arc<AppEvents>>,
+
+    #[builder(default)]
+    pub is_subgraph: bool,
+
     #[builder(default)]
     pub streaming: bool,
 
@@ -239,11 +300,22 @@ pub struct RunContext {
     pub errors: ErrorList<anyhow::Error>,
 }
 
+impl RunContext {
+    #[inline]
+    pub fn event(&self, event: AppEvent) {
+        let Some(queue) = &self.events else {
+            return;
+        };
+
+        queue.insert(event);
+    }
+}
+
 #[derive(TypedBuilder)]
 pub struct RootContext {
     /// A full copy of the current graph
     #[builder(default)]
-    pub graph: ShadowGraph<WorkNode>,
+    pub workflow: Workflow,
 
     #[builder(default)]
     pub model: String,
@@ -262,8 +334,8 @@ pub struct RootContext {
 
 impl RootContext {
     pub fn inputs(&self) -> Result<Vec<Option<Value>>, WorkflowError> {
-        let schema: serde_json::Value = if !self.graph.schema.is_empty() {
-            serde_json::from_str(&self.graph.schema)
+        let schema: serde_json::Value = if !self.workflow.metadata.schema.is_empty() {
+            serde_json::from_str(&self.workflow.metadata.schema)
                 .map_err(|_| WorkflowError::Conversion("Invalid input schema".into()))?
         } else {
             serde_json::json!({})
@@ -352,6 +424,80 @@ impl AsRef<Uuid> for GraphId {
     }
 }
 
+#[skip_serializing_none]
+#[derive(Debug, Default, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowMeta {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: Arc<String>,
+
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub schema: Arc<String>,
+
+    #[serde(default, skip_serializing_if = "im::OrdSet::is_empty")]
+    pub chain: im::OrdSet<String>,
+}
+
+impl ShadowMeta {
+    pub fn is_empty(&self) -> bool {
+        self.description.is_empty() && self.schema.is_empty() && self.chain.is_empty()
+    }
+}
+
+trait ArcMeta {
+    fn with_description(&self, desc: &str) -> Self;
+    fn with_schema(&self, schema: &str) -> Self;
+    fn with_chain(&self, name: &str) -> Self;
+    fn without_chain(&self, name: &str) -> Self;
+}
+
+impl ArcMeta for Arc<ShadowMeta> {
+    fn with_description(&self, desc: &str) -> Self {
+        if desc == self.description.as_str() {
+            self.clone()
+        } else {
+            Arc::new(ShadowMeta {
+                description: Arc::new(desc.to_string()),
+                ..self.as_ref().clone()
+            })
+        }
+    }
+
+    fn with_schema(&self, schema: &str) -> Self {
+        if self.schema.as_str() == schema {
+            self.clone()
+        } else {
+            Arc::new(ShadowMeta {
+                schema: Arc::new(schema.to_string()),
+                ..self.as_ref().clone()
+            })
+        }
+    }
+
+    fn with_chain(&self, name: &str) -> Self {
+        if self.chain.contains(name) {
+            self.clone()
+        } else {
+            Arc::new(ShadowMeta {
+                chain: self.chain.update(name.to_string()),
+                ..self.as_ref().clone()
+            })
+        }
+    }
+
+    fn without_chain(&self, name: &str) -> Self {
+        if !self.chain.contains(name) {
+            self.clone()
+        } else {
+            Arc::new(ShadowMeta {
+                chain: self.chain.without(name),
+                ..self.as_ref().clone()
+            })
+        }
+    }
+}
+
+pub type GraphNodeId = (GraphId, NodeId);
+
 /// The shadow graph is incrementally updated when edits are made through the viewer.
 /// Each change creates a new generation. The underlying collections use structure sharing
 /// to make cloning-on-write cheap. This allows shadow graphs to be quickly compared using
@@ -371,12 +517,6 @@ where
 
     #[serde(default, skip_serializing_if = "im::OrdSet::is_empty")]
     pub disabled: im::OrdSet<NodeId>,
-
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub description: Arc<String>,
-
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub schema: Arc<String>,
 
     pub start: Option<NodeId>,
 
@@ -437,8 +577,6 @@ where
             nodes: Default::default(),
             wires: Default::default(),
             disabled: Default::default(),
-            description: Default::default(),
-            schema: Default::default(),
             start: Default::default(),
             finish: Default::default(),
         }
@@ -451,8 +589,6 @@ where
         self.nodes.ptr_eq(&other.nodes)
             && self.wires.ptr_eq(&other.wires)
             && self.disabled.ptr_eq(&other.disabled)
-            && Arc::ptr_eq(&self.description, &other.description)
-            && Arc::ptr_eq(&self.schema, &other.schema)
     }
 
     #[must_use]
@@ -688,20 +824,6 @@ where
             ..self.clone()
         }
     }
-
-    pub fn with_description(&self, desc: &str) -> Self {
-        Self {
-            description: Arc::new(desc.to_string()),
-            ..self.clone()
-        }
-    }
-
-    pub fn with_schema(&self, schema: &str) -> Self {
-        Self {
-            schema: Arc::new(schema.to_string()),
-            ..self.clone()
-        }
-    }
 }
 
 impl ShadowGraph<WorkNode> {
@@ -784,9 +906,66 @@ impl ShadowGraph<WorkNode> {
     }
 }
 
+#[derive(Debug, Default, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Workflow {
+    #[serde(flatten)]
+    pub metadata: Arc<ShadowMeta>,
+
+    #[serde(flatten)]
+    pub graph: Arc<ShadowGraph<WorkNode>>,
+}
+
+impl Workflow {
+    pub fn fast_eq(&self, other: &Self) -> bool {
+        self.graph.fast_eq(&other.graph) && Arc::ptr_eq(&self.metadata, &other.metadata)
+    }
+
+    pub fn with_description(&self, desc: &str) -> Self {
+        Self {
+            metadata: self.metadata.with_description(desc),
+            ..self.clone()
+        }
+    }
+
+    pub fn with_schema(&self, schema: &str) -> Self {
+        Self {
+            metadata: self.metadata.with_schema(schema),
+            ..self.clone()
+        }
+    }
+
+    pub fn with_chain(&self, name: &str) -> Self {
+        Self {
+            metadata: self.metadata.with_chain(name),
+            ..self.clone()
+        }
+    }
+
+    pub fn without_chain(&self, name: &str) -> Self {
+        Self {
+            metadata: self.metadata.without_chain(name),
+            ..self.clone()
+        }
+    }
+
+    pub fn repair(&self) -> Self {
+        let graph = self.graph.repair();
+        let meta = self.metadata.clone();
+
+        Self {
+            graph: Arc::new(graph),
+            metadata: meta,
+        }
+    }
+}
+
 pub trait DynNode {
     fn priority(&self) -> usize {
         5000
+    }
+
+    fn uuid(&self) -> Option<Uuid> {
+        None
     }
 
     fn value(&self, out_pin: usize) -> Value {
@@ -850,7 +1029,8 @@ pub trait DynNode {
         ValueKind::Placeholder
     }
 
-    fn connect(&self, in_pin: usize, kind: ValueKind) -> Result<(), String> {
+    fn connect(&mut self, in_pin: usize, kind: ValueKind, ctx: &EditContext) -> Result<(), String> {
+        let _ = ctx;
         if !self.in_kinds(in_pin).contains(&kind) {
             tracing::warn!(
                 "Refusing to connect {kind:?} to {in_pin:?} accepting {:?}",
@@ -987,6 +1167,8 @@ pub enum WorkflowError {
     #[error("Error while executing subgraph")]
     Subgraph(#[source] Arc<WorkflowError>),
 
+    // #[error("Scripting error {0:?}")]
+    // RhaiScript(#[source] Arc<rhai::EvalAltResult>),
     #[error("{0}")]
     Unknown(String),
 }
@@ -1000,6 +1182,23 @@ impl Serialize for WorkflowError {
     }
 }
 
+impl PartialEq for WorkflowError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Required(l0), Self::Required(r0)) => l0 == r0,
+            (Self::Conversion(l0), Self::Conversion(r0)) => l0 == r0,
+            (Self::Provider(l0), Self::Provider(r0)) => std::ptr::eq(l0, r0),
+            (Self::ToolCall(l0), Self::ToolCall(r0)) => std::ptr::eq(l0, r0),
+            (Self::ToolServerCall(l0), Self::ToolServerCall(r0)) => std::ptr::eq(l0, r0),
+            (Self::Validation(l0), Self::Validation(r0)) => std::ptr::eq(l0, r0),
+            (Self::Unfinished(l0), Self::Unfinished(r0)) => std::ptr::eq(l0, r0),
+            (Self::Subgraph(l0), Self::Subgraph(r0)) => l0 == r0,
+            (Self::Unknown(l0), Self::Unknown(r0)) => l0 == r0,
+            _ => core::mem::discriminant(self) == core::mem::discriminant(other),
+        }
+    }
+}
+
 impl From<ToolSetError> for WorkflowError {
     fn from(value: ToolSetError) -> Self {
         WorkflowError::ToolCall(value)
@@ -1009,6 +1208,12 @@ impl From<ToolSetError> for WorkflowError {
 impl From<ToolServerError> for WorkflowError {
     fn from(value: ToolServerError) -> Self {
         WorkflowError::ToolServerCall(value)
+    }
+}
+
+impl From<Box<rhai::EvalAltResult>> for WorkflowError {
+    fn from(value: Box<rhai::EvalAltResult>) -> Self {
+        WorkflowError::Unknown(value.to_string())
     }
 }
 

@@ -1,6 +1,6 @@
 use std::{borrow::Cow, convert::identity, sync::atomic::Ordering, time::Duration};
 
-use egui::{Align2, ComboBox};
+use egui::{Align2, Color32, ComboBox};
 use egui_extras::{Size, StripBuilder};
 use egui_phosphor::regular::{
     ARROW_CLOCKWISE, ARROW_COUNTER_CLOCKWISE, DOWNLOAD_SIMPLE, INFO, MAGIC_WAND, PENCIL, TRASH,
@@ -15,6 +15,7 @@ use crate::{
         AppEvent, ShowHelp,
         runner::{play_button, stop_button},
         shortcuts::{SHORTCUT_HELP, SHORTCUT_RUN, ShortcutHandler, show_shortcuts, squelch},
+        state::MetaEdit,
         workflow::get_snarl_style,
     },
     utils::ErrorDistiller as _,
@@ -23,13 +24,16 @@ use crate::{
 
 impl super::AppState {
     pub fn workflow_ui(&mut self, ui: &mut egui::Ui) {
+        let mut pointee = false;
         let running = self
             .workflows
             .running
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || self.task_count.load(Ordering::Relaxed) > 0;
 
+        let busy = self.task_count.load(Ordering::Relaxed) > 0;
         // Shortcuts at the start of the fn will run even if other widget focused
-        if !running && ui.ctx().input_mut(|i| i.consume_shortcut(&SHORTCUT_RUN)) {
+        if !busy && !running && ui.ctx().input_mut(|i| i.consume_shortcut(&SHORTCUT_RUN)) {
             self.events.insert(AppEvent::UserRunWorkflow);
         }
 
@@ -38,16 +42,18 @@ impl super::AppState {
             // Snarl will draw our persisted positions and sizes.
             let mut snarl = self.workflows.view_stack.root_snarl().unwrap();
 
-            let (mut shadow, widget) = {
+            let (shadow, widget) = {
+                let meta = self.workflows.shadow.metadata.clone();
                 let shadow = self.workflows.view_stack.leaf();
                 let viewer = self.workflow_viewer();
                 // Needed for preserving changes by events, but is there a better way?
                 viewer.shadow = shadow;
+                viewer.edit_ctx.metadata = meta;
 
                 let widget = SnarlWidget::new()
                     .id(viewer.view_id)
                     .style(get_snarl_style());
-                widget.show(&mut snarl, viewer, ui);
+                pointee = widget.show(&mut snarl, viewer, ui).contains_pointer();
 
                 // Unfortunately, there's no event for node movement so we have to
                 // iterate through the whole collection to find moved nodes.
@@ -64,18 +70,24 @@ impl super::AppState {
                 .default_size(egui::vec2(200.0, 100.0))
                 .movable(true)
                 .show(ui.ctx(), |ui| {
+                    use MetaEdit::*;
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
-                        ui.selectable_value(&mut self.workflows.meta_edit, 0, "Description");
-                        ui.selectable_value(&mut self.workflows.meta_edit, 1, "Schema");
+                        ui.selectable_value(
+                            &mut self.workflows.meta_edit,
+                            Description,
+                            "Description",
+                        );
+                        ui.selectable_value(&mut self.workflows.meta_edit, Schema, "Schema");
+                        ui.selectable_value(&mut self.workflows.meta_edit, Chain, "Chain");
                     });
 
                     let size = ui.available_size();
 
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        if self.workflows.meta_edit == 0 {
+                    egui::ScrollArea::vertical().show(ui, |ui| match self.workflows.meta_edit {
+                        Description => {
                             let mut description =
-                                Cow::Borrowed(self.workflows.shadow.description.as_str());
+                                Cow::Borrowed(self.workflows.shadow.metadata.description.as_str());
 
                             squelch(
                                 ui.add_sized(
@@ -86,10 +98,13 @@ impl super::AppState {
                             );
 
                             if let Cow::Owned(desc) = description {
-                                shadow = shadow.with_description(&desc);
+                                self.workflows.shadow =
+                                    self.workflows.shadow.with_description(&desc);
                             }
-                        } else {
-                            let mut schema = Cow::Borrowed(self.workflows.shadow.schema.as_str());
+                        }
+                        Schema => {
+                            let mut schema =
+                                Cow::Borrowed(self.workflows.shadow.metadata.schema.as_str());
 
                             squelch(
                                 ui.add_sized(
@@ -100,28 +115,43 @@ impl super::AppState {
                             );
 
                             if let Cow::Owned(schema) = schema {
-                                shadow = shadow.with_schema(&schema);
+                                self.workflows.shadow = self.workflows.shadow.with_schema(&schema);
                             }
+                        }
+                        Chain => {
+                            egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                                let meta = self.workflows.shadow.metadata.clone();
+                                let workflows: im::OrdSet<String> =
+                                    self.workflows.names().map(|s| s.to_string()).collect();
+                                for name in &workflows.clone().union(meta.chain.clone()) {
+                                    let mut checked = meta.chain.contains(name);
+
+                                    let mut atom = egui::RichText::new(name);
+                                    if !workflows.contains(name) {
+                                        atom = atom.strikethrough().color(Color32::RED);
+                                    }
+
+                                    let widget = egui::Checkbox::new(&mut checked, atom);
+                                    let description = self.workflows.store.description(name);
+
+                                    if ui.add(widget).on_hover_text(description).clicked() {
+                                        if checked {
+                                            self.workflows.shadow =
+                                                self.workflows.shadow.with_chain(name);
+                                        } else {
+                                            self.workflows.shadow =
+                                                self.workflows.shadow.without_chain(name);
+                                        }
+                                    }
+                                }
+                            });
                         }
                     });
                 });
 
-            let shadow = {
-                // Must trigger other shortcuts after editor otherwise spurious activations
-                let viewer = self.workflow_viewer();
-                viewer.shadow = shadow.clone();
-                let mut shortcuts = ShortcutHandler::builder()
-                    .snarl(&mut snarl)
-                    .viewer(viewer)
-                    .build();
-
-                shortcuts.viewer_shortcuts(ui, widget);
-                viewer.shadow.clone()
-            };
-
             self.workflows
                 .view_stack
-                .propagate(shadow, identity)
+                .propagate(shadow.clone(), identity)
                 .unwrap();
 
             egui::Area::new(egui::Id::new("workflow controls"))
@@ -138,6 +168,25 @@ impl super::AppState {
                             self.workflow_controls(ui);
                         });
                 });
+
+            if pointee {
+                let shadow = {
+                    // Must trigger other shortcuts after editor otherwise spurious activations
+                    let viewer = self.workflow_viewer();
+                    let mut shortcuts = ShortcutHandler::builder()
+                        .snarl(&mut snarl)
+                        .viewer(viewer)
+                        .build();
+
+                    shortcuts.viewer_shortcuts(ui, widget);
+                    viewer.shadow.clone()
+                };
+
+                self.workflows
+                    .view_stack
+                    .propagate(shadow, identity)
+                    .unwrap();
+            }
         });
 
         if ui.ctx().input_mut(|i| i.consume_shortcut(&SHORTCUT_HELP)) {
@@ -162,6 +211,7 @@ impl super::AppState {
             .workflows
             .running
             .load(std::sync::atomic::Ordering::Relaxed);
+        let busy = self.task_count.load(Ordering::Relaxed) > 0;
 
         ui.set_max_width(150.0);
         ui.vertical_centered_justified(|ui| {
@@ -191,7 +241,7 @@ impl super::AppState {
                 });
 
             if let Some(renaming) = self.workflows.renaming.as_mut() {
-                let editor = ui.text_edit_singleline(renaming);
+                let editor = squelch(ui.text_edit_singleline(renaming));
                 if editor.lost_focus() {
                     errors.distil(self.workflows.rename());
                 }
@@ -373,7 +423,7 @@ impl super::AppState {
                             self.workflows.interrupt.store(true, Ordering::Relaxed);
                         }
                     });
-                } else if ui.add(play_button()).clicked() {
+                } else if ui.add_enabled(!busy, play_button()).clicked() {
                     self.events.insert(AppEvent::UserRunWorkflow);
                 }
             });

@@ -34,6 +34,8 @@ impl super::AppState {
             let run_ctx = RunContext::builder()
                 .runtime(self.rt.clone())
                 .agent_factory(self.agent_factory.clone())
+                .metadata(self.workflows.shadow.metadata.clone())
+                .events(Some(self.events.clone()))
                 .node_state(self.workflows.node_state.clone())
                 .previews(self.workflows.previews.clone())
                 .transmuter(self.transmuter.clone())
@@ -47,7 +49,7 @@ impl super::AppState {
 
             let inputs = RootContext::builder()
                 .history(self.session.history.clone())
-                .graph(self.workflows.shadow.clone())
+                .workflow(self.workflows.shadow.clone())
                 .user_prompt(prompt)
                 .model(self.settings.view(|s| s.llm_model.clone()))
                 .temperature(self.settings.view(|s| s.temperature))
@@ -60,10 +62,14 @@ impl super::AppState {
             let mut exec = WorkflowRunner::builder()
                 .inputs(inputs)
                 .run_ctx(run_ctx)
-                .state_view(self.workflows.node_state.view(&self.workflows.shadow.uuid))
+                .state_view(
+                    self.workflows
+                        .node_state
+                        .view(&self.workflows.shadow.graph.uuid),
+                )
                 .build();
 
-            exec.init(&self.workflows.shadow);
+            exec.init(&self.workflows.shadow.graph);
 
             exec
         };
@@ -117,7 +123,7 @@ impl super::AppState {
                     let Ok((label, value)) = rx.recv() else {
                         break;
                     };
-                    tracing::info!("Received output {label}: {value:?}");
+                    tracing::debug!("Received output {label}: {value:?}");
 
                     outputs.rcu(|it| it.update(label.clone(), value.clone()));
                 }

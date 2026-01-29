@@ -7,8 +7,9 @@ use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use super::{DynNode, EditContext, RunContext, UiNode, Value, ValueKind};
 use crate::{
-    ChatContent, ToolProvider, ToolSelector,
+    ToolProvider, ToolSelector,
     config::Ternary,
+    toolbox::{ChainBreaker, ChainTool},
     ui::{resizable_frame, resizable_frame_opt, shortcuts::squelch},
     workflow::{FlexNode, WorkflowError},
 };
@@ -35,9 +36,36 @@ impl DynNode for Tools {
         assert_eq!(out_pin, 0);
         ValueKind::Tools
     }
+
     fn value(&self, out_pin: usize) -> Value {
         assert_eq!(out_pin, 0);
         Value::Tools(self.toolset.clone())
+    }
+
+    fn execute(
+        &mut self,
+        ctx: &RunContext,
+        node_id: egui_snarl::NodeId,
+        inputs: Vec<Option<Value>>,
+    ) -> Result<Vec<Value>, WorkflowError> {
+        use rig::tool::Tool as _;
+        let _ = (ctx, node_id, inputs);
+        let toolbox = &ctx.agent_factory.toolbox;
+        let mut toolset = self.toolset.as_ref().clone();
+        if ctx.is_subgraph {
+            toolset = toolbox.toggle_provider(&toolset, ChainTool::NAME, Ternary::None);
+        } else {
+            let providers = toolbox.providers.load();
+            if let Some(chainer) = providers.get(ChainTool::NAME) {
+                for tool in chainer.all_tool_names() {
+                    if tool != ChainBreaker::NAME && !ctx.metadata.chain.contains(&*tool) {
+                        toolset = toolbox.toggle_tool(&toolset, ChainTool::NAME, &tool, false);
+                    }
+                }
+            }
+        }
+
+        Ok(vec![Value::Tools(Arc::new(toolset))])
     }
 }
 
@@ -78,7 +106,13 @@ impl UiNode for Tools {
 
                     ui.separator();
 
-                    for (name, provider) in &ctx.toolbox.providers {
+                    for (name, provider) in ctx.toolbox.providers.load().iter() {
+                        if matches!(provider, ToolProvider::Chainer { .. })
+                            && (ctx.parent_id.is_some() || ctx.metadata.chain.is_empty())
+                        {
+                            continue;
+                        }
+
                         egui::collapsing_header::CollapsingState::load_with_default_open(
                             ui.ctx(),
                             ui.id().with(name),
@@ -129,7 +163,14 @@ impl UiNode for Tools {
                                 }
                             }
                             ToolProvider::Chainer { .. } => {
+                                use rig::tool::Tool as _;
                                 for tool in provider.all_tool_names() {
+                                    if tool != ChainBreaker::NAME
+                                        && !ctx.metadata.chain.contains(&*tool)
+                                    {
+                                        continue;
+                                    }
+
                                     let mut active = self.toolset.apply(name, &tool);
                                     let desc = provider.tool_description(&tool);
 
@@ -657,10 +698,11 @@ impl InvokeTool {
         self.validate(&inputs)?;
 
         let chat = match &inputs[0] {
-            Some(Value::Chat(history)) => history,
-            None => Err(WorkflowError::Required(vec![
-                "Chat history required".into(),
-            ]))?,
+            Some(Value::Chat(history)) => Some(history),
+            None => None,
+            // None => Err(WorkflowError::Required(vec![
+            //     "Chat history required".into(),
+            // ]))?,
             _ => unreachable!(),
         };
 
@@ -708,20 +750,17 @@ impl InvokeTool {
             };
 
         let msg = Message::tool_result(tool_name, &tool_output);
-        let chat = chat.extend(vec![Ok(msg).into()])?;
-        let history = Arc::new(chat.into_owned());
 
-        let msg = if let Some(entry) = history.last()
-            && let ChatContent::Message(message) = &entry.content
-        {
-            Value::Message(message.clone())
+        let history = if let Some(chat) = chat {
+            let chat = chat.extend(vec![Ok(msg.clone()).into()])?;
+            Value::Chat(Arc::new(chat.into_owned()))
         } else {
-            Value::Placeholder(ValueKind::Message)
+            Value::Placeholder(ValueKind::Chat)
         };
 
         Ok(vec![
-            Value::Chat(history.clone()),
-            msg,
+            history,
+            Value::Message(msg),
             Value::Text(Arc::new(tool_output.clone())),
             Value::Placeholder(ValueKind::Failure),
         ])
