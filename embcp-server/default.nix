@@ -1,5 +1,4 @@
 {
-  sources,
   pkgs,
   fenix,
   rust-toolchain,

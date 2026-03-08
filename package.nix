@@ -1,17 +1,13 @@
 {
-  sources ? import ./nix/sources.nix,
-  pkgs ? import sources.nixpkgs {},
-  fenix ? import sources.fenix {},
-  gitignore ? import sources."gitignore.nix" {},
-  nixgl ? import sources.nixGL {},
+  pkgs,
+  fenix,
+  gitignore,
+  nixgl,
+  naersk,
   rust-toolchain ? fenix.combine [
     fenix.complete.toolchain
     fenix.targets.wasm32-unknown-unknown.latest.rust-std
   ],
-  naersk ? pkgs.callPackage sources.naersk {
-    cargo = rust-toolchain;
-    rustc = rust-toolchain;
-  },
 }:
 let
   libraries = with pkgs; [
@@ -21,7 +17,7 @@ let
   ];
 
   callPackage = pkgs.lib.callPackageWith {
-    inherit sources pkgs fenix rust-toolchain naersk gitignore nixgl;
+    inherit pkgs fenix rust-toolchain naersk gitignore nixgl;
     inherit (gitignore) gitignoreSource;
   };
 in
