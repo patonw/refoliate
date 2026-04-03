@@ -4,11 +4,14 @@ use std::{
     time::Duration,
 };
 
-use crate::rig::{
-    self, OneOrMany,
-    agent::PromptRequest,
-    completion::{Completion, CompletionError, CompletionResponse},
-    message::{AssistantContent, Message, Reasoning, ToolCall, ToolFunction, UserContent},
+use crate::{
+    rig::{
+        self, OneOrMany,
+        agent::PromptRequest,
+        completion::{Completion, CompletionError, CompletionResponse},
+        message::{AssistantContent, Message, Reasoning, ToolCall, ToolFunction, UserContent},
+    },
+    utils::{ErrorDistiller, canonicalize_msg},
 };
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -52,7 +55,7 @@ impl DynNode for ChatNode {
         Cow::Borrowed(match in_pin {
             0 => &[ValueKind::Agent],
             1 => &[ValueKind::Chat],
-            2 => &[ValueKind::Text, ValueKind::Message, ValueKind::Json],
+            2 => &[ValueKind::Message, ValueKind::Text, ValueKind::Json],
             _ => ValueKind::all(),
         })
     }
@@ -151,10 +154,10 @@ impl UiNode for ChatNode {
                                         );
                                     });
                             });
-                            self.ghost_pin(ValueKind::Text.color())
+                            self.ghost_pin(ValueKind::Message.color())
                         } else {
                             ui.label("prompt");
-                            ValueKind::Text.default_pin()
+                            ValueKind::Message.default_pin()
                         }
                     })
                     .inner;
@@ -185,12 +188,14 @@ impl ChatNode {
             _ => unreachable!(),
         };
 
-        let mut messages = chat.iter_msgs().map(|it| it.into_owned()).collect_vec();
+        let mut messages = chat.iter_msgs().map(|it| it.as_ref().clone()).collect_vec();
 
         let prompt = match &inputs[2] {
             Some(Value::Text(text)) if !text.is_empty() => Message::user((**text).clone()),
-            Some(Value::Message(msg @ Message::User { .. })) => msg.clone(),
-            Some(Value::Message(msg @ Message::Assistant { .. })) => {
+            Some(Value::Message(msg)) if matches!(**msg, Message::User { .. }) => {
+                msg.as_ref().clone()
+            }
+            Some(Value::Message(msg)) if matches!(**msg, Message::Assistant { .. }) => {
                 // Coerce into user message if we want to use another agent's output for cross talk
                 Message::user(message_text(msg))
             }
@@ -206,6 +211,17 @@ impl ChatNode {
             }
             _ => Err(WorkflowError::Required(vec!["A prompt is required".into()]))?,
         };
+
+        let prompt = tokio::task::spawn_blocking(move || canonicalize_msg(prompt))
+            .await
+            .map_err(|e| WorkflowError::Unknown(e.to_string()))?;
+
+        let prompt = prompt.map_err(|errs| {
+            for err in errs {
+                run_ctx.errors.push(err);
+            }
+            WorkflowError::Unknown("Could not resolve images".into())
+        })?;
 
         let last_idx = messages.len();
 
@@ -225,7 +241,7 @@ impl ChatNode {
                         scratch.push_back(Ok(msg.clone()));
                     }
 
-                    chat = chat.try_moo(|c| c.push(Ok(msg).into()))?;
+                    chat = chat.try_moo(|c| c.push(Ok(Arc::new(msg)).into()))?;
                 }
             }
             Err(err) => Err(WorkflowError::Provider(err.into()))?,
@@ -280,7 +296,7 @@ impl DynNode for StructuredChat {
             0 => &[ValueKind::Agent],
             1 => &[ValueKind::Chat],
             2 => &[ValueKind::Json],
-            3 => &[ValueKind::Text, ValueKind::Message, ValueKind::Json],
+            3 => &[ValueKind::Message, ValueKind::Text, ValueKind::Json],
             _ => ValueKind::all(),
         })
     }
@@ -340,7 +356,7 @@ impl UiNode for StructuredChat {
     ) -> egui_snarl::ui::PinInfo {
         match pin_id {
             0 => {
-                ui.label("history");
+                ui.label("conversation");
             }
             1 => {
                 ui.label("response");
@@ -371,7 +387,7 @@ impl UiNode for StructuredChat {
                 ui.label("agent");
             }
             1 => {
-                ui.label("history");
+                ui.label("conversation");
             }
             2 => {
                 ui.label("schema");
@@ -395,10 +411,10 @@ impl UiNode for StructuredChat {
                                         );
                                     });
                             });
-                            self.ghost_pin(ValueKind::Text.color())
+                            self.ghost_pin(ValueKind::Message.color())
                         } else {
                             ui.label("prompt");
-                            ValueKind::Text.default_pin()
+                            ValueKind::Message.default_pin()
                         }
                     })
                     .inner;
@@ -461,7 +477,7 @@ impl StructuredChat {
 
         let prompt = match &inputs[3] {
             Some(Value::Text(text)) if !text.is_empty() => Some(Message::user((**text).clone())),
-            Some(Value::Message(msg)) => Some(msg.clone()),
+            Some(Value::Message(msg)) => Some(msg.as_ref().clone()),
             Some(Value::Json(value)) => match value.as_ref() {
                 serde_json::Value::String(text) => Some(Message::user(text.as_str())),
                 value => Some(Message::user(serde_json::to_string(value).map_err(
@@ -470,6 +486,21 @@ impl StructuredChat {
             },
             None if !self.prompt.is_empty() => Some(Message::user(self.prompt.clone())),
             _ => None,
+        };
+
+        let prompt = if let Some(prompt) = prompt {
+            let message = tokio::task::spawn_blocking(move || canonicalize_msg(prompt))
+                .await
+                .map_err(|e| WorkflowError::Unknown(e.to_string()))?;
+            Some(message.map_err(|errs| {
+                for err in errs {
+                    run_ctx.errors.push(err);
+                }
+
+                WorkflowError::Unknown("Could not resolve images".into())
+            })?)
+        } else {
+            None
         };
 
         let validator = if let Some(schema) = schema.as_ref() {
@@ -497,7 +528,7 @@ impl StructuredChat {
                 scratch.push_back(Ok(prompt.clone()));
             }
 
-            chat = chat.try_moo(|c| c.push(Ok(prompt).into()))?;
+            chat = chat.try_moo(|c| c.push(Ok(Arc::new(prompt)).into()))?;
         }
         // else if !matches!(
         //     chat.last(),
@@ -516,7 +547,7 @@ impl StructuredChat {
             }
 
             // chat is the source of truth. history is just its shadow.
-            let mut history = chat.iter_msgs().map(|it| it.into_owned()).collect_vec();
+            let mut history = chat.iter_msgs().map(|it| it.as_ref().clone()).collect_vec();
             // Use the last message as the prompt
             let current_prompt = history.pop().unwrap();
 
@@ -584,7 +615,7 @@ impl StructuredChat {
                         }
                     }
 
-                    chat = chat.try_moo(|c| c.push(Ok(agent_msg).into()))?;
+                    chat = chat.try_moo(|c| c.push(Ok(Arc::new(agent_msg)).into()))?;
 
                     if let Some(tool_func) = tool_func {
                         let tool_name = tool_func.name.clone();

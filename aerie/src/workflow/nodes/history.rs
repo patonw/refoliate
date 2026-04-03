@@ -1,15 +1,18 @@
 use std::{borrow::Cow, sync::Arc};
 
-use crate::rig::{
-    OneOrMany,
-    message::{AssistantContent, Message, ToolCall, ToolFunction},
+use crate::{
+    rig::{
+        OneOrMany,
+        message::{AssistantContent, Message, ToolCall, ToolFunction},
+    },
+    utils::image_url_rig,
 };
 use itertools::Itertools as _;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
 use crate::{
-    ChatContent,
+    ChatContent, rig,
     ui::{resizable_frame, shortcuts::squelch},
     utils::EVec2,
     workflow::{FlexNode, WorkflowError},
@@ -233,8 +236,16 @@ pub struct CreateMessage {
 impl FlexNode for CreateMessage {}
 
 impl DynNode for CreateMessage {
-    fn in_kinds(&'_ self, _in_pin: usize) -> Cow<'_, [ValueKind]> {
-        Cow::Borrowed(&[ValueKind::Text, ValueKind::Json])
+    fn inputs(&self) -> usize {
+        2
+    }
+
+    fn in_kinds(&'_ self, in_pin: usize) -> Cow<'_, [ValueKind]> {
+        match in_pin {
+            0 => Cow::Borrowed(&[ValueKind::Text, ValueKind::Json]),
+            1 => Cow::Borrowed(&[ValueKind::TextList, ValueKind::Text, ValueKind::Json]),
+            _ => unreachable!(),
+        }
     }
 
     fn out_kind(&self, _out_pin: usize) -> ValueKind {
@@ -280,10 +291,10 @@ impl DynNode for CreateMessage {
                     AssistantContent::tool_call("", "", data.as_ref().clone())
                 };
 
-                Some(ChatContent::Message(Message::Assistant {
+                Some(ChatContent::Message(Arc::new(Message::Assistant {
                     id: None,
                     content: OneOrMany::one(content),
-                }))
+                })))
             }
             _ => {
                 let text = match &inputs[0] {
@@ -298,15 +309,45 @@ impl DynNode for CreateMessage {
                     _ => unreachable!(),
                 };
 
+                let images = match &inputs[1] {
+                    Some(Value::TextList(texts)) => texts.clone(),
+                    Some(Value::Text(text)) => im::vector![text.clone()],
+                    Some(Value::Json(data)) if data.is_array() => data
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|it| it.as_str())
+                        .map(|s| Arc::new(s.to_string()))
+                        .collect(),
+                    Some(Value::Json(data)) if data.is_string() => {
+                        im::vector!(Arc::new(data.as_str().unwrap().to_string()))
+                    }
+                    None => Default::default(),
+                    _ => unreachable!(),
+                };
+
                 Some(match self.kind {
                     MessageKind::Error => ChatContent::Error {
                         err: (*text).clone(),
                     },
-                    MessageKind::User => ChatContent::Message(Message::user(&*text)),
-                    MessageKind::Assistant => ChatContent::Message(Message::assistant(&*text)),
+                    MessageKind::User => {
+                        let mut content =
+                            rig::OneOrMany::one(rig::message::UserContent::text(&*text));
+
+                        for url in &images {
+                            let image = image_url_rig(url)?;
+                            content.push(rig::message::UserContent::Image(image));
+                        }
+
+                        let msg = Message::User { content };
+                        ChatContent::Message(Arc::new(msg))
+                    }
+                    MessageKind::Assistant => {
+                        ChatContent::Message(Arc::new(Message::assistant(&*text)))
+                    }
                     MessageKind::ToolResult => {
                         let message = Message::tool_result("", &*text);
-                        ChatContent::Message(message)
+                        ChatContent::Message(Arc::new(message))
                     }
                     _ => unreachable!(),
                 })
@@ -319,7 +360,7 @@ impl DynNode for CreateMessage {
 
         let msg = match value {
             ChatContent::Message(message) => message.clone(),
-            ChatContent::Error { err } => Message::user(format!("Error:\n{err:?}")),
+            ChatContent::Error { err } => Arc::new(Message::user(format!("Error:\n{err:?}"))),
             _ => unreachable!(),
         };
 
@@ -357,6 +398,9 @@ impl UiNode for CreateMessage {
                 } else {
                     ui.label("content");
                 }
+            }
+            1 => {
+                ui.label("images").on_hover_text("image URLs");
             }
             _ => unreachable!(),
         };
@@ -431,7 +475,7 @@ impl DynNode for ExtendHistory {
             })
             .collect_vec();
 
-        let extended = history.extend(messages.into_iter().map(|msg| Ok(msg).into()))?;
+        let extended = history.extend(messages.into_iter().map(|msg| Ok(msg.clone()).into()))?;
         let value = Arc::new(extended.into_owned());
 
         Ok(vec![Value::Chat(value)])

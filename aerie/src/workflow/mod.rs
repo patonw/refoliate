@@ -1,4 +1,5 @@
 use crate::rig::{
+    self,
     message::Message,
     tool::{ToolSetError, server::ToolServerError},
 };
@@ -70,7 +71,7 @@ pub enum Value {
     Agent(Arc<AgentSpec>),
     Tools(Arc<ToolSelector>),
     Chat(Arc<ChatHistory>),
-    Message(Message),
+    Message(Arc<Message>),
     MsgList(Vector<Arc<Message>>),
 }
 
@@ -350,6 +351,9 @@ pub struct RootContext {
     /// The user's prompt that initiated the workflow run
     #[builder(default)]
     pub user_prompt: String,
+
+    #[builder(default)]
+    pub extra_content: Vec<rig::message::UserContent>,
 }
 
 impl RootContext {
@@ -361,13 +365,20 @@ impl RootContext {
             serde_json::json!({})
         };
 
+        let mut content = rig::OneOrMany::one(rig::message::UserContent::text(&self.user_prompt));
+        for it in &self.extra_content {
+            content.push(it.clone());
+        }
+
+        let msg = Message::User { content };
+
         // TODO: Probably don't need most of these in the object
         let values = vec![
             Some(Value::Text(Arc::new(self.model.clone()))),
             Some(Value::Number(E64::assert(self.temperature))),
             Some(Value::Chat(self.history.load().clone())),
             Some(Value::Json(Arc::new(schema))),
-            Some(Value::Text(Arc::new(self.user_prompt.clone()))),
+            Some(Value::Message(Arc::new(msg))),
         ];
         Ok(values)
     }
@@ -1274,7 +1285,6 @@ pub fn write_value(mut fh: impl std::io::Write, value: &Value) -> Result<(), any
             serde_json::to_writer(fh, value.as_ref())?;
         }
         Value::Chat(value) => {
-            let value = value.iter_msgs().map(|it| it.into_owned()).collect_vec();
             serde_yml::to_writer(fh, &value)?;
         }
         Value::Message(value) => {

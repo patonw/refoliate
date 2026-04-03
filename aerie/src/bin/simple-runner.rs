@@ -2,6 +2,7 @@ use std::{fs::OpenOptions, path::PathBuf, sync::Arc};
 
 use aerie::{
     AgentFactory, ChatSession, Settings,
+    rig::message::UserContent,
     storage::CachedDirStore as _,
     toolbox::ToolStore,
     utils::message_text,
@@ -15,7 +16,6 @@ use aerie::{
 use arc_swap::{ArcSwap, ArcSwapOption};
 use clap::Parser;
 use egui_snarl::Snarl;
-use itertools::Itertools as _;
 use serde::Serializer as _;
 use serde_json::json;
 use serde_yaml_ng as serde_yml;
@@ -67,6 +67,10 @@ struct Args {
 
     #[arg(short = 'I', long)]
     input_file: Option<PathBuf>,
+
+    /// Either a file path or data url
+    #[arg(long, action = clap::ArgAction::Append)]
+    image: Vec<String>,
 
     /// Save outputs as individual files in a directory
     #[arg(short, long)]
@@ -163,6 +167,8 @@ fn main() -> anyhow::Result<()> {
 
     let next_workflow: Arc<ArcSwapOption<String>> = Default::default();
     let next_prompt: Arc<ArcSwapOption<String>> = Default::default();
+    let next_images: Arc<ArcSwap<Vec<String>>> = Default::default();
+
     let mut agent_factory = AgentFactory::builder()
         .rt(rt.handle().clone())
         .settings(Arc::new(ArcSwap::from_pointee(settings.clone())))
@@ -170,6 +176,7 @@ fn main() -> anyhow::Result<()> {
         .store(workflow_store.clone())
         .next_workflow(next_workflow.clone())
         .next_prompt(next_prompt.clone())
+        .next_images(next_images.clone())
         .build();
 
     agent_factory.reload_tools()?;
@@ -197,6 +204,8 @@ fn main() -> anyhow::Result<()> {
         prompt = std::fs::read_to_string(path)?;
     }
 
+    let mut images: Vec<String> = args.image.clone();
+
     let workflow_path = args.workflow.as_path();
     let mut shadow: Workflow = if workflow_path.is_file() {
         let reader = OpenOptions::new().read(true).open(workflow_path)?;
@@ -208,6 +217,13 @@ fn main() -> anyhow::Result<()> {
     };
 
     for run_count in 0..=args.autoruns {
+        let mut extra_content = Vec::new();
+        for image in &images {
+            let content = UserContent::image_url(image, None, None);
+
+            extra_content.push(content);
+        }
+
         let run_ctx = RunContext::builder()
             .runtime(rt.handle().clone())
             .exec_id(shadow.graph.uuid.into())
@@ -234,7 +250,8 @@ fn main() -> anyhow::Result<()> {
         let inputs = RootContext::builder()
             .history(session.history.clone())
             .workflow(shadow.clone())
-            .user_prompt(prompt.clone())
+            .user_prompt(std::mem::take(&mut prompt))
+            .extra_content(extra_content)
             .model(settings.llm_model.clone())
             .temperature(settings.temperature)
             .build()
@@ -284,6 +301,9 @@ fn main() -> anyhow::Result<()> {
                 prompt = next_prompt.as_ref().to_owned();
             }
 
+            // TODO: efficiency
+            images = next_images.swap(Default::default()).as_ref().clone();
+
             if let Some(next_workflow) = next_workflow.swap(Default::default()).as_ref()
                 && let Some(store) = &mut workflow_store
             {
@@ -301,9 +321,11 @@ fn main() -> anyhow::Result<()> {
         let next_prompt = next_prompt
             .swap(Default::default())
             .map(|s| s.as_ref().clone());
+        let next_images = next_images.swap(Default::default()).as_ref().clone();
         let blob = json!({
             "next_workflow": next_workflow,
             "next_prompt": next_prompt,
+            "next_images": next_images,
         });
 
         println!("{blob}");
@@ -332,10 +354,7 @@ async fn console_output(
                 mapper.serialize_entry(&label, &value).unwrap()
             }
             aerie::workflow::Value::Json(value) => mapper.serialize_entry(&label, &value).unwrap(),
-            aerie::workflow::Value::Chat(chat) => {
-                let value = chat.iter_msgs().map(|it| it.into_owned()).collect_vec();
-                mapper.serialize_entry(&label, &value).unwrap()
-            }
+            aerie::workflow::Value::Chat(chat) => mapper.serialize_entry(&label, &chat).unwrap(),
             aerie::workflow::Value::Message(message) => {
                 let text = message_text(&message);
 
